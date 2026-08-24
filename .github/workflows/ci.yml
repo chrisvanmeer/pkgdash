@@ -11,8 +11,8 @@ jobs:
     name: Lint Go Code
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
       - name: golangci-lint
@@ -22,7 +22,7 @@ jobs:
     name: Lint Markdown
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Markdown Lint
         uses: DavidAnson/markdownlint-cli2-action@v18
         with:
@@ -33,8 +33,8 @@ jobs:
     name: Verify Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
       - name: Build binaries
