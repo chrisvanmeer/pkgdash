@@ -1,6 +1,6 @@
-# Compiled binaries
-pkgdash
-pkgdashd
+# Compiled binaries (root-anchored)
+/pkgdash
+/pkgdashd
 *.exe
 *.exe.manifest
 *.dll
