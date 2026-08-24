@@ -873,9 +873,9 @@ func (m model) View() string {
 	headerCard := headerPanelStyle.Render(headerContent)
 
 	// --- SEARCH FILTER CARDS ---
-	cw1 := int(float64(availWidth) * 0.28)
-	cw2 := int(float64(availWidth) * 0.40)
-	cw3 := availWidth - cw1 - cw2 - 3
+	cw1 := int(float64(availWidth)*0.28) + 4
+	cw2 := int(float64(availWidth)*0.40) + 3
+	cw3 := availWidth - cw1 - cw2 + 6
 
 	m.hostInput.Width = cw1 - 5
 	m.pkgInput.Width = cw2 - 5
@@ -917,7 +917,8 @@ func (m model) View() string {
 
 		cardContent := lipgloss.JoinVertical(lipgloss.Left, headerLine, inputLine)
 
-		return bStyle.Render(cardContent)
+		// Fix: Dwing de exacte breedte af op de kaartstijl
+		return bStyle.Width(safeInnerW).Render(cardContent)
 	}
 
 	cardHost := renderFilterCard("HOST", m.hostInput, m.focusedInput == 0, m.hostInput.Value(), cw1)
