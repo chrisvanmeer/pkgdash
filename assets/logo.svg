@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" width="100%" height="100%">
+  <defs>
+    <linearGradient id="purpleGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7D56F4" />
+      <stop offset="100%" stop-color="#FF79C6" />
+    </linearGradient>
+    <linearGradient id="cyanGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#04D9D9" />
+      <stop offset="100%" stop-color="#50FA7B" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background Card -->
+  <rect width="800" height="200" rx="16" fill="#11111b" stroke="#313244" stroke-width="2"/>
+  
+  <!-- Grid Lines background pattern -->
+  <path d="M0 40 H800 M0 80 H800 M0 120 H800 M0 160 H800" stroke="#181825" stroke-width="1"/>
+  
+  <!-- Cyberpunk Package Icon -->
+  <g transform="translate(60, 35)">
+    <!-- Top Face -->
+    <polygon points="65,15 115,40 65,65 15,40" fill="#181825" stroke="#04D9D9" stroke-width="3" filter="url(#glow)"/>
+    <!-- Left Face -->
+    <polygon points="15,40 65,65 65,125 15,100" fill="#11111b" stroke="#7D56F4" stroke-width="3"/>
+    <!-- Right Face -->
+    <polygon points="65,65 115,40 115,100 65,125" fill="#1e1e2e" stroke="#FF79C6" stroke-width="3"/>
+    <!-- Package Accents -->
+    <line x1="65" y1="15" x2="65" y2="65" stroke="#04D9D9" stroke-width="2" stroke-dasharray="4"/>
+    <line x1="40" y1="27.5" x2="90" y2="52.5" stroke="#FF79C6" stroke-width="2"/>
+    <circle cx="65" cy="65" r="4" fill="#50FA7B"/>
+  </g>
+
+  <!-- Logo Typography -->
+  <rect x="210" y="52" width="8" height="15" fill="#50FA7B"/>
+  <text x="226" y="64" font-family="'JetBrains Mono', 'Fira Code', 'Courier New', monospace" font-size="13" font-weight="bold" fill="#6C7086" letter-spacing="1">v1.0 // FLEET_DAEMON</text>
+  
+  <text x="208" y="120" font-family="'JetBrains Mono', 'Fira Code', 'Courier New', monospace" font-size="60" font-weight="900" fill="#CDD6F4" letter-spacing="2">PKG<tspan fill="url(#purpleGlow)">DASH</tspan></text>
+  
+  <text x="210" y="152" font-family="'JetBrains Mono', 'Fira Code', 'Courier New', monospace" font-size="13" font-weight="700" fill="#04D9D9" letter-spacing="3">⚡ HIGH-PERFORMANCE FLEET INVENTORY</text>
+</svg>

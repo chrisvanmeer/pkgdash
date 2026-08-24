@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Multi-Platform Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Cross-compile Binaries
+        run: |
+          mkdir -p dist
+
+          # Linux AMD64
+          GOOS=linux GOARCH=amd64 go build -o dist/pkgdash-linux-amd64 ./cmd/pkgdash
+          GOOS=linux GOARCH=amd64 go build -o dist/pkgdashd-linux-amd64 ./cmd/pkgdashd
+
+          # Linux ARM64
+          GOOS=linux GOARCH=arm64 go build -o dist/pkgdash-linux-arm64 ./cmd/pkgdash
+          GOOS=linux GOARCH=arm64 go build -o dist/pkgdashd-linux-arm64 ./cmd/pkgdashd
+
+          # macOS ARM64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -o dist/pkgdash-darwin-arm64 ./cmd/pkgdash
+          GOOS=darwin GOARCH=arm64 go build -o dist/pkgdashd-darwin-arm64 ./cmd/pkgdashd
+
+          # macOS AMD64 (Intel)
+          GOOS=darwin GOARCH=amd64 go build -o dist/pkgdash-darwin-amd64 ./cmd/pkgdash
+          GOOS=darwin GOARCH=amd64 go build -o dist/pkgdashd-darwin-amd64 ./cmd/pkgdashd
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,13 @@
+# Auto-detect text files and handle line endings automatically
+* text=auto
+
+# Enforce Unix line endings (LF) for Go code, configurations, and documentation
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

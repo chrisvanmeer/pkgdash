@@ -1,0 +1,29 @@
+# Compiled binaries
+pkgdash
+pkgdashd
+*.exe
+*.exe.manifest
+*.dll
+*.so
+*.dylib
+
+# Go build & test cache / output
+*.out
+*.test
+vendor/
+
+# Local configuration files & TLS keys
+pkgdash.config
+*.pem
+*.key
+*.env
+
+# Exported CSV data files
+*.csv
+
+# OS & IDE specific files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
