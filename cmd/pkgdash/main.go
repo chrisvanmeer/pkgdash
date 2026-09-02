@@ -131,7 +131,8 @@ var (
 	filterBoxBlurred = lipgloss.NewStyle().
 				Border(lipgloss.NormalBorder()).
 				BorderForeground(cBorder).
-				Padding(0, 1)
+				Padding(0, 1).
+				Align(lipgloss.Left)
 
 	filterBoxFocused = filterBoxBlurred.BorderForeground(cPink)
 
@@ -162,10 +163,7 @@ var (
 			Background(cPink).
 			Bold(true)
 
-	selectedDiffStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#45475A")).
-				Foreground(lipgloss.Color("#FFFFFF")).
-				Bold(true)
+	selectedDiffStyle = selectedStyle
 
 	insightBoxStyle = lipgloss.NewStyle().
 			Foreground(cCyan).
@@ -246,24 +244,30 @@ func main() {
 
 	hi := textinput.New()
 	hi.Placeholder = PlaceholderHost
+	hi.Prompt = ""
 	hi.Focus()
 
 	pi := textinput.New()
 	pi.Placeholder = PlaceholderPkg
+	pi.Prompt = ""
 
 	vi := textinput.New()
 	vi.Placeholder = PlaceholderVer
+	vi.Prompt = ""
 
 	// Diff Select Inputs
 	diffA := textinput.New()
 	diffA.Placeholder = "Type hostname or pattern for Host A..."
+	diffA.Prompt = ""
 
 	diffB := textinput.New()
 	diffB.Placeholder = "Type hostname or pattern for Host B..."
+	diffB.Prompt = ""
 
 	// Diff Filter Input
 	diffF := textinput.New()
 	diffF.Placeholder = "Filter compared packages..."
+	diffF.Prompt = ""
 
 	updateChan := make(chan dataMsg)
 
@@ -799,7 +803,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				hostA := m.resolveHost(m.diffHostAInput.Value())
 				hostB := m.resolveHost(m.diffHostBInput.Value())
 
-				// If input matches typeahead suggestion, pick top suggestion
 				if hostA == "" {
 					matchesA := m.getMatchedHosts(m.diffHostAInput.Value(), "")
 					if len(matchesA) > 0 {
@@ -1282,7 +1285,6 @@ func (m model) View() string {
 			modalOuterW = 70
 		}
 
-		// Calculate exact outer panel width and inner content area width (panelOuterW - 4 for borders + padding)
 		panelOuterW := (modalOuterW - 9) / 2
 		panelInnerW := panelOuterW - 4
 		if panelInnerW < 20 {
@@ -1474,9 +1476,9 @@ func (m model) View() string {
 	headerCard := headerPanelStyle.Render(headerContent)
 
 	// --- SEARCH FILTER CARDS ---
-	cw1 := int(float64(availWidth) * 0.28)
-	cw2 := int(float64(availWidth) * 0.40)
-	cw3 := availWidth - cw1 - cw2 - 3
+	cw1 := int(float64(availWidth)*0.28) + 2
+	cw2 := int(float64(availWidth)*0.40) + 1
+	cw3 := availWidth - cw1 - cw2
 
 	m.hostInput.Width = cw1 - 5
 	m.pkgInput.Width = cw2 - 5
@@ -1495,7 +1497,7 @@ func (m model) View() string {
 			bStyle = filterBoxBlurred
 		}
 
-		safeInnerW := cardTotalWidth - 4
+		safeInnerW := cardTotalWidth - 2
 		if safeInnerW < 1 {
 			safeInnerW = 1
 		}
