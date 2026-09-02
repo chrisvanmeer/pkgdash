@@ -114,16 +114,19 @@ Then run simply:
 
 ## ⌨️ TUI Keybindings
 
-| Keybinding          | Action                                                       |
-| :------------------ | :----------------------------------------------------------- |
-| `Enter`             | Open host detail modal (Hostname, IP, OS, Function)          |
-| `Tab` / `Shift+Tab` | Cycle focus between Host, Package, and Version filter fields |
-| `Ctrl+H`            | Sort by **Hostname** (toggle Ascending/Descending)           |
-| `Ctrl+P`            | Sort by **Package Name** (toggle Ascending/Descending)       |
-| `Ctrl+V`            | Sort by **Version** (toggle Ascending/Descending)            |
-| `Ctrl+S`            | Export current filtered view to `pkgdash_output.csv`         |
-| `Ctrl+C`            | Open About / Control Center modal                            |
-| `Esc`               | Close modal / Exit dashboard                                 |
+| Keybinding              | Action                                                              |
+| :---------------------- | :------------------------------------------------------------------ |
+| `Enter`                 | Open host detail modal (Hostname, IP, OS, Function)                 |
+| `Ctrl+D`                | Open Host Comparison (Diff) modal                                   |
+| `Ctrl+T` (in Diff view) | Toggle between all packages and Diffs Only mode                     |
+| `Ctrl+E`                | Export unique hostnames from search results to `temp_inventory.ini` |
+| `Ctrl+S`                | Export current filtered view to `pkgdash_output.csv`                |
+| `Tab` / `Shift+Tab`     | Cycle focus between Host, Package, and Version filter fields        |
+| `Ctrl+H`                | Sort by **Hostname** (toggle Ascending/Descending)                  |
+| `Ctrl+P`                | Sort by **Package Name** (toggle Ascending/Descending)              |
+| `Ctrl+V`                | Sort by **Version** (toggle Ascending/Descending)                   |
+| `Ctrl+C`                | Open About / Control Center modal                                   |
+| `Esc`                   | Close modal / Exit dashboard                                        |
 
 ---
 

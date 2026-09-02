@@ -58,6 +58,13 @@ type FlatItem struct {
 	Arch         string
 }
 
+type DiffRow struct {
+	PkgName  string
+	VersionA string
+	VersionB string
+	IsDiff   bool
+}
+
 type SortColumn int
 
 const (
@@ -155,6 +162,11 @@ var (
 			Background(cPink).
 			Bold(true)
 
+	selectedDiffStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("#45475A")).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Bold(true)
+
 	insightBoxStyle = lipgloss.NewStyle().
 			Foreground(cCyan).
 			Italic(true)
@@ -168,7 +180,7 @@ var (
 	modalStyle = lipgloss.NewStyle().
 			Border(lipgloss.DoubleBorder()).
 			BorderForeground(cPurple).
-			Padding(1, 4).
+			Padding(1, 3).
 			Align(lipgloss.Center)
 )
 
@@ -201,6 +213,25 @@ type model struct {
 	showHostModal  bool
 	selectedHost   FlatItem
 
+	// Diff Selection Modal
+	showDiffSelectModal bool
+	diffHostAInput      textinput.Model
+	diffHostBInput      textinput.Model
+	diffSelectFocused   int // 0: Host A, 1: Host B
+	diffSelectError     string
+
+	// Diff View Modal
+	showDiffViewModal bool
+	diffFilterInput   textinput.Model
+	selectedHostA     string
+	selectedHostB     string
+	diffAllItems      []DiffRow
+	diffFiltered      []DiffRow
+	diffCursor        int
+	diffOffset        int
+	diffVisibleLines  int
+	diffOnlyDiffs     bool
+
 	flashMsg   string
 	updateChan chan dataMsg
 	hasTLS     bool
@@ -223,6 +254,17 @@ func main() {
 	vi := textinput.New()
 	vi.Placeholder = PlaceholderVer
 
+	// Diff Select Inputs
+	diffA := textinput.New()
+	diffA.Placeholder = "Type hostname or pattern for Host A..."
+
+	diffB := textinput.New()
+	diffB.Placeholder = "Type hostname or pattern for Host B..."
+
+	// Diff Filter Input
+	diffF := textinput.New()
+	diffF.Placeholder = "Filter compared packages..."
+
 	updateChan := make(chan dataMsg)
 
 	hasTLS := false
@@ -234,20 +276,24 @@ func main() {
 	}
 
 	m := model{
-		hostInput:      hi,
-		pkgInput:       pi,
-		verInput:       vi,
-		focusedInput:   0,
-		sortCol:        SortHostname,
-		sortDesc:       false,
-		offset:         0,
-		cursor:         0,
-		showAboutModal: false,
-		showHostModal:  false,
-		loaded:         false,
-		updateChan:     updateChan,
-		hasTLS:         hasTLS,
-		hasPSK:         psk != "",
+		hostInput:       hi,
+		pkgInput:        pi,
+		verInput:        vi,
+		diffHostAInput:  diffA,
+		diffHostBInput:  diffB,
+		diffFilterInput: diffF,
+		focusedInput:    0,
+		sortCol:         SortHostname,
+		sortDesc:        false,
+		offset:          0,
+		cursor:          0,
+		showAboutModal:  false,
+		showHostModal:   false,
+		loaded:          false,
+		updateChan:      updateChan,
+		hasTLS:          hasTLS,
+		hasPSK:          psk != "",
+		diffOnlyDiffs:   false,
 	}
 
 	go fetchAllDataAsync(servers, psk, updateChan)
@@ -475,6 +521,59 @@ func (m *model) updateViewport() {
 	}
 }
 
+func (m *model) getUniqueHosts() []string {
+	hostMap := make(map[string]bool)
+	for _, item := range m.allItems {
+		if strings.TrimSpace(item.Hostname) != "" {
+			hostMap[item.Hostname] = true
+		}
+	}
+	var hosts []string
+	for h := range hostMap {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
+func (m *model) getMatchedHosts(query, exclude string) []string {
+	all := m.getUniqueHosts()
+	var matches []string
+	qLower := strings.ToLower(strings.TrimSpace(query))
+
+	for _, h := range all {
+		if exclude != "" && strings.EqualFold(h, exclude) {
+			continue
+		}
+		if qLower == "" || strings.Contains(strings.ToLower(h), qLower) {
+			matches = append(matches, h)
+		}
+		if len(matches) >= 4 {
+			break
+		}
+	}
+	return matches
+}
+
+func (m *model) resolveHost(query string) string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return ""
+	}
+	hosts := m.getUniqueHosts()
+	for _, h := range hosts {
+		if strings.EqualFold(h, query) {
+			return h
+		}
+	}
+	for _, h := range hosts {
+		if strings.Contains(strings.ToLower(h), strings.ToLower(query)) {
+			return h
+		}
+	}
+	return ""
+}
+
 func saveCSV(items []FlatItem) string {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -504,6 +603,135 @@ func saveCSV(items []FlatItem) string {
 	return fmt.Sprintf("✓ Exported %d records to %s", len(items), filepath.Base(path))
 }
 
+func saveInventory(items []FlatItem) string {
+	if len(items) == 0 {
+		return "No search results to export to inventory"
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Sprintf("Error getting directory: %v", err)
+	}
+
+	hostMap := make(map[string]bool)
+	for _, item := range items {
+		if strings.TrimSpace(item.Hostname) != "" {
+			hostMap[item.Hostname] = true
+		}
+	}
+
+	if len(hostMap) == 0 {
+		return "No valid hosts found in search results"
+	}
+
+	var hosts []string
+	for h := range hostMap {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+
+	path := filepath.Join(cwd, "temp_inventory.ini")
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Sprintf("Error creating inventory file: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+
+	var sb strings.Builder
+	sb.WriteString("[all]\n")
+	for _, h := range hosts {
+		sb.WriteString(h + "\n")
+	}
+
+	if _, err := file.WriteString(sb.String()); err != nil {
+		return fmt.Sprintf("Error writing inventory file: %v", err)
+	}
+
+	return fmt.Sprintf("✓ Exported %d host(s) to %s", len(hosts), filepath.Base(path))
+}
+
+func buildDiffData(hostA, hostB string, allItems []FlatItem) []DiffRow {
+	pkgsA := make(map[string]string)
+	pkgsB := make(map[string]string)
+	allPkgNamesMap := make(map[string]bool)
+
+	for _, item := range allItems {
+		if strings.EqualFold(item.Hostname, hostA) {
+			pkgsA[item.PkgName] = item.Version
+			allPkgNamesMap[item.PkgName] = true
+		}
+		if strings.EqualFold(item.Hostname, hostB) {
+			pkgsB[item.PkgName] = item.Version
+			allPkgNamesMap[item.PkgName] = true
+		}
+	}
+
+	var pkgNames []string
+	for name := range allPkgNamesMap {
+		pkgNames = append(pkgNames, name)
+	}
+	sort.Strings(pkgNames)
+
+	var rows []DiffRow
+	for _, name := range pkgNames {
+		verA, hasA := pkgsA[name]
+		if !hasA {
+			verA = "-"
+		}
+		verB, hasB := pkgsB[name]
+		if !hasB {
+			verB = "-"
+		}
+
+		isDiff := (verA != verB)
+
+		rows = append(rows, DiffRow{
+			PkgName:  name,
+			VersionA: verA,
+			VersionB: verB,
+			IsDiff:   isDiff,
+		})
+	}
+
+	return rows
+}
+
+func (m *model) filterDiffItems() {
+	q := strings.TrimSpace(m.diffFilterInput.Value())
+	matcher := createFieldMatcher(q)
+
+	var filtered []DiffRow
+	for _, item := range m.diffAllItems {
+		if m.diffOnlyDiffs && !item.IsDiff {
+			continue
+		}
+		if q == "" || matcher(item.PkgName) || matcher(item.VersionA) || matcher(item.VersionB) {
+			filtered = append(filtered, item)
+		}
+	}
+	m.diffFiltered = filtered
+}
+
+func (m *model) updateDiffViewport() {
+	if len(m.diffFiltered) == 0 {
+		m.diffCursor = 0
+		m.diffOffset = 0
+		return
+	}
+
+	if m.diffCursor < 0 {
+		m.diffCursor = 0
+	} else if m.diffCursor >= len(m.diffFiltered) {
+		m.diffCursor = len(m.diffFiltered) - 1
+	}
+
+	if m.diffCursor < m.diffOffset {
+		m.diffOffset = m.diffCursor
+	} else if m.diffCursor >= m.diffOffset+m.diffVisibleLines {
+		m.diffOffset = m.diffCursor - m.diffVisibleLines + 1
+	}
+}
+
 func (m model) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, waitForUpdate(m.updateChan))
 }
@@ -531,11 +759,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForUpdate(m.updateChan)
 	}
 
+	// 1. About or Host Detail Modals
 	if m.showAboutModal || m.showHostModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
-			switch msg.Type {
-			case tea.KeyEsc, tea.KeyEnter, tea.KeyCtrlC:
+			switch msg.String() {
+			case "esc", "enter", "ctrl+c":
 				m.showAboutModal = false
 				m.showHostModal = false
 			}
@@ -546,56 +775,220 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// 2. Diff Host Selection Modal
+	if m.showDiffSelectModal {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc", "ctrl+c":
+				m.showDiffSelectModal = false
+				return m, nil
+
+			case "tab", "shift+tab":
+				m.diffSelectFocused = (m.diffSelectFocused + 1) % 2
+				if m.diffSelectFocused == 0 {
+					m.diffHostAInput.Focus()
+					m.diffHostBInput.Blur()
+				} else {
+					m.diffHostAInput.Blur()
+					m.diffHostBInput.Focus()
+				}
+				return m, nil
+
+			case "enter":
+				hostA := m.resolveHost(m.diffHostAInput.Value())
+				hostB := m.resolveHost(m.diffHostBInput.Value())
+
+				// If input matches typeahead suggestion, pick top suggestion
+				if hostA == "" {
+					matchesA := m.getMatchedHosts(m.diffHostAInput.Value(), "")
+					if len(matchesA) > 0 {
+						hostA = matchesA[0]
+					}
+				}
+				if hostB == "" {
+					matchesB := m.getMatchedHosts(m.diffHostBInput.Value(), hostA)
+					if len(matchesB) > 0 {
+						hostB = matchesB[0]
+					}
+				}
+
+				if hostA == "" {
+					m.diffSelectError = fmt.Sprintf("Host A '%s' not found in fleet", m.diffHostAInput.Value())
+					return m, nil
+				}
+				if hostB == "" {
+					m.diffSelectError = fmt.Sprintf("Host B '%s' not found in fleet", m.diffHostBInput.Value())
+					return m, nil
+				}
+				if strings.EqualFold(hostA, hostB) {
+					m.diffSelectError = "Host A and Host B must be different servers!"
+					return m, nil
+				}
+
+				m.selectedHostA = hostA
+				m.selectedHostB = hostB
+				m.diffAllItems = buildDiffData(hostA, hostB, m.allItems)
+				m.diffFilterInput.SetValue("")
+				m.diffFilterInput.Focus()
+				m.diffOnlyDiffs = false
+				m.filterDiffItems()
+				m.diffCursor = 0
+				m.diffOffset = 0
+
+				m.showDiffSelectModal = false
+				m.showDiffViewModal = true
+				return m, nil
+			}
+
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+		}
+
+		if m.diffSelectFocused == 0 {
+			m.diffHostAInput, cmd = m.diffHostAInput.Update(msg)
+		} else {
+			m.diffHostBInput, cmd = m.diffHostBInput.Update(msg)
+		}
+		return m, cmd
+	}
+
+	// 3. Diff View Modal
+	if m.showDiffViewModal {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc", "ctrl+c":
+				m.showDiffViewModal = false
+				return m, nil
+
+			case "ctrl+t", "ctrl+d":
+				m.diffOnlyDiffs = !m.diffOnlyDiffs
+				m.filterDiffItems()
+				m.diffCursor = 0
+				m.diffOffset = 0
+				m.updateDiffViewport()
+				return m, nil
+
+			case "up", "ctrl+k":
+				m.diffCursor--
+				m.updateDiffViewport()
+				return m, nil
+
+			case "down", "ctrl+j":
+				m.diffCursor++
+				m.updateDiffViewport()
+				return m, nil
+
+			case "pgup":
+				m.diffCursor -= m.diffVisibleLines
+				m.updateDiffViewport()
+				return m, nil
+
+			case "pgdown":
+				m.diffCursor += m.diffVisibleLines
+				m.updateDiffViewport()
+				return m, nil
+			}
+
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.diffVisibleLines = m.height - 18
+			if m.diffVisibleLines < 3 {
+				m.diffVisibleLines = 3
+			}
+			m.updateDiffViewport()
+		}
+
+		prevQuery := m.diffFilterInput.Value()
+		m.diffFilterInput, cmd = m.diffFilterInput.Update(msg)
+		if m.diffFilterInput.Value() != prevQuery {
+			m.filterDiffItems()
+			m.diffCursor = 0
+			m.updateDiffViewport()
+		}
+
+		return m, cmd
+	}
+
+	// 4. Main View Keyboard Navigation
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if msg.Type != tea.KeyCtrlS {
+		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" {
 			m.flashMsg = ""
 		}
 
-		switch msg.Type {
-		case tea.KeyEsc:
+		switch msg.String() {
+		case "esc":
 			return m, tea.Quit
-		case tea.KeyEnter:
+		case "enter":
 			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				m.selectedHost = m.filtered[m.cursor]
 				m.showHostModal = true
 			}
 			return m, nil
-		case tea.KeyCtrlC:
+		case "ctrl+c":
 			m.showAboutModal = true
 			return m, nil
-		case tea.KeyCtrlS:
+		case "ctrl+s":
 			m.flashMsg = saveCSV(m.filtered)
 			return m, nil
+		case "ctrl+e":
+			m.flashMsg = saveInventory(m.filtered)
+			return m, nil
+		case "ctrl+d":
+			if len(m.allItems) == 0 {
+				m.flashMsg = "No host data available to compare"
+				return m, nil
+			}
+			m.showDiffSelectModal = true
+			m.diffSelectError = ""
+			m.diffSelectFocused = 0
 
-		case tea.KeyTab:
+			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
+				m.diffHostAInput.SetValue(m.filtered[m.cursor].Hostname)
+				m.diffHostBInput.SetValue("")
+				m.diffSelectFocused = 1
+				m.diffHostAInput.Blur()
+				m.diffHostBInput.Focus()
+			} else {
+				m.diffHostAInput.SetValue("")
+				m.diffHostBInput.SetValue("")
+				m.diffHostAInput.Focus()
+				m.diffHostBInput.Blur()
+			}
+			return m, nil
+
+		case "tab":
 			m.switchFocus(m.focusedInput + 1)
 			return m, nil
-		case tea.KeyShiftTab:
+		case "shift+tab":
 			m.switchFocus(m.focusedInput - 1)
 			return m, nil
 
-		case tea.KeyUp, tea.KeyCtrlK:
+		case "up", "ctrl+k":
 			m.cursor--
 			m.updateViewport()
 			return m, nil
 
-		case tea.KeyDown, tea.KeyCtrlJ:
+		case "down", "ctrl+j":
 			m.cursor++
 			m.updateViewport()
 			return m, nil
 
-		case tea.KeyPgUp:
+		case "pgup":
 			m.cursor -= m.visibleLines
 			m.updateViewport()
 			return m, nil
 
-		case tea.KeyPgDown:
+		case "pgdown":
 			m.cursor += m.visibleLines
 			m.updateViewport()
 			return m, nil
 
-		case tea.KeyCtrlH:
+		case "ctrl+h":
 			if m.sortCol == SortHostname {
 				m.sortDesc = !m.sortDesc
 			} else {
@@ -607,7 +1000,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateViewport()
 			return m, nil
 
-		case tea.KeyCtrlP:
+		case "ctrl+p":
 			if m.sortCol == SortPackage {
 				m.sortDesc = !m.sortDesc
 			} else {
@@ -619,7 +1012,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateViewport()
 			return m, nil
 
-		case tea.KeyCtrlV:
+		case "ctrl+v":
 			if m.sortCol == SortVersion {
 				m.sortDesc = !m.sortDesc
 			} else {
@@ -643,6 +1036,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.visibleLines = 1
 		}
 		m.updateViewport()
+
+		m.diffVisibleLines = m.height - 18
+		if m.diffVisibleLines < 3 {
+			m.diffVisibleLines = 3
+		}
 	}
 
 	var hPrev, pPrev, vPrev string
@@ -771,6 +1169,7 @@ func (m model) View() string {
 		return "Initializing Dashboard..."
 	}
 
+	// 1. About Modal
 	if m.showAboutModal {
 		modalContent := lipgloss.JoinVertical(lipgloss.Center,
 			titleBadge.Render(" PKGDASH CONTROL CENTER "),
@@ -786,6 +1185,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
+	// 2. Host Detail Modal
 	if m.showHostModal {
 		osStr := strings.TrimSpace(m.selectedHost.OSName + " " + m.selectedHost.OSVersion)
 		if osStr == "" {
@@ -820,6 +1220,207 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
+	// 3. Diff Selection Modal with Styled Typeahead
+	if m.showDiffSelectModal {
+		titleBar := titleBadge.Render(" ⚔️ COMPARE HOST PACKAGES (DIFF) ")
+
+		errText := ""
+		if m.diffSelectError != "" {
+			errText = lipgloss.NewStyle().Foreground(cPink).Bold(true).Render("⚠️ " + m.diffSelectError)
+		}
+
+		labelAStyle := labelBlurred
+		labelBStyle := labelBlurred
+		if m.diffSelectFocused == 0 {
+			labelAStyle = labelFocused
+		} else {
+			labelBStyle = labelFocused
+		}
+
+		formatSuggestions := func(matches []string) string {
+			if len(matches) == 0 {
+				return lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render("   💡 Suggestions: (no hosts found)")
+			}
+			var pills []string
+			for _, h := range matches {
+				pills = append(pills, lipgloss.NewStyle().Foreground(cCyan).Bold(true).Render(h))
+			}
+			return lipgloss.NewStyle().Foreground(cMuted).Render("   💡 Suggestions: ") + strings.Join(pills, lipgloss.NewStyle().Foreground(cMuted).Render("  •  "))
+		}
+
+		matchesA := m.getMatchedHosts(m.diffHostAInput.Value(), "")
+		matchesB := m.getMatchedHosts(m.diffHostBInput.Value(), m.resolveHost(m.diffHostAInput.Value()))
+
+		form := lipgloss.JoinVertical(lipgloss.Left,
+			lipgloss.JoinHorizontal(lipgloss.Left, labelAStyle.Render("Host A (Base):   "), m.diffHostAInput.View()),
+			formatSuggestions(matchesA),
+			"",
+			lipgloss.JoinHorizontal(lipgloss.Left, labelBStyle.Render("Host B (Target): "), m.diffHostBInput.View()),
+			formatSuggestions(matchesB),
+		)
+
+		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Field  |  [Enter] Compare Top Match  |  [Esc] Cancel")
+
+		content := lipgloss.JoinVertical(lipgloss.Center,
+			titleBar,
+			"",
+			form,
+			"",
+			errText,
+			"",
+			helpText,
+		)
+
+		dialog := modalStyle.Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+	}
+
+	// 4. Diff View Modal
+	if m.showDiffViewModal {
+		modalOuterW := m.width - 10
+		if modalOuterW < 70 {
+			modalOuterW = 70
+		}
+
+		// Calculate exact outer panel width and inner content area width (panelOuterW - 4 for borders + padding)
+		panelOuterW := (modalOuterW - 9) / 2
+		panelInnerW := panelOuterW - 4
+		if panelInnerW < 20 {
+			panelInnerW = 20
+			panelOuterW = panelInnerW + 4
+		}
+
+		pkgColW := int(float64(panelInnerW) * 0.58)
+		verColW := panelInnerW - pkgColW
+
+		titleBar := titleBadge.Render(fmt.Sprintf(" ⚔️ DIFF: %s vs %s ", m.selectedHostA, m.selectedHostB))
+
+		m.diffFilterInput.Width = modalOuterW - 20
+		searchLine := lipgloss.JoinHorizontal(lipgloss.Left,
+			labelFocused.Render("❯ Filter: "),
+			m.diffFilterInput.View(),
+		)
+
+		hdrA := tableHeaderStyle.Width(panelInnerW).MaxWidth(panelInnerW).Align(lipgloss.Center).Render(truncate("🖥️ Host A: "+m.selectedHostA, panelInnerW))
+		hdrB := tableHeaderStyle.Width(panelInnerW).MaxWidth(panelInnerW).Align(lipgloss.Center).Render(truncate("🖥️ Host B: "+m.selectedHostB, panelInnerW))
+
+		colHdrA := lipgloss.JoinHorizontal(lipgloss.Left,
+			tableHeaderStyle.Width(pkgColW).MaxWidth(pkgColW).Render(" PACKAGE"),
+			tableHeaderStyle.Width(verColW).MaxWidth(verColW).Render(" VERSION"),
+		)
+		colHdrB := lipgloss.JoinHorizontal(lipgloss.Left,
+			tableHeaderStyle.Width(pkgColW).MaxWidth(pkgColW).Render(" PACKAGE"),
+			tableHeaderStyle.Width(verColW).MaxWidth(verColW).Render(" VERSION"),
+		)
+
+		panelHdrA := lipgloss.JoinVertical(lipgloss.Left, hdrA, colHdrA)
+		panelHdrB := lipgloss.JoinVertical(lipgloss.Left, hdrB, colHdrB)
+
+		start := m.diffOffset
+		end := m.diffOffset + m.diffVisibleLines
+		if end > len(m.diffFiltered) {
+			end = len(m.diffFiltered)
+		}
+
+		viewport := m.diffFiltered[start:end]
+
+		var rowsA []string
+		var rowsB []string
+
+		styleSamePkg := lipgloss.NewStyle().Foreground(cText)
+		styleSameVer := lipgloss.NewStyle().Foreground(cMuted)
+		styleDiffA := lipgloss.NewStyle().Foreground(cCyan).Bold(true)
+		styleDiffB := lipgloss.NewStyle().Foreground(cPink).Bold(true)
+		styleMissing := lipgloss.NewStyle().Foreground(cMuted).Italic(true)
+
+		for i, item := range viewport {
+			absIdx := start + i
+			isSelected := absIdx == m.diffCursor
+
+			stPkgA, stVerA := styleSamePkg, styleSameVer
+			stPkgB, stVerB := styleSamePkg, styleSameVer
+
+			if item.IsDiff {
+				if item.VersionA == "-" {
+					stVerA = styleMissing
+				} else {
+					stVerA = styleDiffA
+				}
+
+				if item.VersionB == "-" {
+					stVerB = styleMissing
+				} else {
+					stVerB = styleDiffB
+				}
+			}
+
+			if isSelected {
+				stPkgA = selectedDiffStyle
+				stVerA = selectedDiffStyle
+				stPkgB = selectedDiffStyle
+				stVerB = selectedDiffStyle
+			}
+
+			rPkgA := truncate(" "+item.PkgName, pkgColW)
+			rVerA := truncate(" "+item.VersionA, verColW)
+			rPkgB := truncate(" "+item.PkgName, pkgColW)
+			rVerB := truncate(" "+item.VersionB, verColW)
+
+			cellPkgA := stPkgA.Width(pkgColW).MaxWidth(pkgColW).Render(rPkgA)
+			cellVerA := stVerA.Width(verColW).MaxWidth(verColW).Render(rVerA)
+			cellPkgB := stPkgB.Width(pkgColW).MaxWidth(pkgColW).Render(rPkgB)
+			cellVerB := stVerB.Width(verColW).MaxWidth(verColW).Render(rVerB)
+
+			rowsA = append(rowsA, lipgloss.JoinHorizontal(lipgloss.Left, cellPkgA, cellVerA))
+			rowsB = append(rowsB, lipgloss.JoinHorizontal(lipgloss.Left, cellPkgB, cellVerB))
+		}
+
+		for i := len(viewport); i < m.diffVisibleLines; i++ {
+			rowsA = append(rowsA, strings.Repeat(" ", panelInnerW))
+			rowsB = append(rowsB, strings.Repeat(" ", panelInnerW))
+		}
+
+		bodyA := strings.Join(rowsA, "\n")
+		bodyB := strings.Join(rowsB, "\n")
+
+		boxA := panelStyle.BorderForeground(cCyan).Width(panelOuterW).Render(lipgloss.JoinVertical(lipgloss.Left, panelHdrA, bodyA))
+		boxB := panelStyle.BorderForeground(cPink).Width(panelOuterW).Render(lipgloss.JoinVertical(lipgloss.Left, panelHdrB, bodyB))
+
+		panels := lipgloss.JoinHorizontal(lipgloss.Top, boxA, " ", boxB)
+
+		diffCount := 0
+		for _, item := range m.diffAllItems {
+			if item.IsDiff {
+				diffCount++
+			}
+		}
+
+		modeTag := "All Packages"
+		if m.diffOnlyDiffs {
+			modeTag = "Only Diffs [Active]"
+		}
+
+		statsText := fmt.Sprintf("📊 Comparison: %d differences out of %d total packages  |  Mode: %s", diffCount, len(m.diffAllItems), modeTag)
+		stats := insightBoxStyle.Render(truncate(statsText, modalOuterW-8))
+
+		help := lipgloss.NewStyle().Foreground(cMuted).Render("[Ctrl+T] Toggle Diffs Only  |  [Filter] Search  |  [▲/▼] Scroll  |  [Esc] Close")
+
+		content := lipgloss.JoinVertical(lipgloss.Center,
+			titleBar,
+			"",
+			searchLine,
+			"",
+			panels,
+			"",
+			stats,
+			help,
+		)
+
+		dialog := modalStyle.Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+	}
+
+	// 5. Main Dashboard View
 	availWidth := m.width - 2
 	if availWidth < 60 {
 		return "Terminal window too small..."
@@ -873,9 +1474,9 @@ func (m model) View() string {
 	headerCard := headerPanelStyle.Render(headerContent)
 
 	// --- SEARCH FILTER CARDS ---
-	cw1 := int(float64(availWidth)*0.28) + 4
-	cw2 := int(float64(availWidth)*0.40) + 3
-	cw3 := availWidth - cw1 - cw2 + 6
+	cw1 := int(float64(availWidth) * 0.28)
+	cw2 := int(float64(availWidth) * 0.40)
+	cw3 := availWidth - cw1 - cw2 - 3
 
 	m.hostInput.Width = cw1 - 5
 	m.pkgInput.Width = cw2 - 5
@@ -917,7 +1518,6 @@ func (m model) View() string {
 
 		cardContent := lipgloss.JoinVertical(lipgloss.Left, headerLine, inputLine)
 
-		// Fix: Dwing de exacte breedte af op de kaartstijl
 		return bStyle.Width(safeInnerW).Render(cardContent)
 	}
 
@@ -1009,7 +1609,7 @@ func (m model) View() string {
 		displayStart = start + 1
 	}
 
-	keyHelp := "[Enter] Host Info  |  [Tab] Switch Filter  |  [Ctrl+H/P/V] Sort  |  [Ctrl+S] Export CSV"
+	keyHelp := "[Enter] Info  |  [Ctrl+D] Diff  |  [Ctrl+E] Export INI  |  [Ctrl+S] Export CSV  |  [Tab] Switch"
 	counterText := fmt.Sprintf("Records: %d-%d / %d (Total: %d)", displayStart, end, len(m.filtered), len(m.allItems))
 
 	footerText := fmt.Sprintf("%s  •  %s", keyHelp, counterText)
