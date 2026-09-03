@@ -1,6 +1,7 @@
 # Compiled binaries (root-anchored)
 /pkgdash
 /pkgdashd
+/pkgdash-web
 *.exe
 *.exe.manifest
 *.dll

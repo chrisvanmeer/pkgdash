@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  pkgdash-web:
+    build: .
+    container_name: pkgdash-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Target URL of your backend daemon (pkgdashd)
+      - PKGDASH_SERVERS=https://pkgdashd.internal.domain:9876
+
+      # Optional: Pre-Shared Key if authentication is enabled
+      # - PKGDASH_PSK=your-secret-key
+
+      # Web server listening port
+      - PKGDASH_WEB_PORT=:8080
+
+      # Optional: Container timezone configuration
+      - TZ=Europe/Amsterdam
