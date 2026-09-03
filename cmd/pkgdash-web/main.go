@@ -69,7 +69,7 @@ func main() {
 		log.Fatal("No servers found. Set PKGDASH_SERVERS or configure ~/.local/pkgdash.config")
 	}
 
-	// Start background fetcher loop (polls every 15 seconds)
+	// Start background data synchronization loop (polls backend every 15 seconds)
 	go func() {
 		for {
 			fetchAllData(serversConfig, pskConfig)
@@ -77,7 +77,7 @@ func main() {
 		}
 	}()
 
-	// Wait briefly for first data to arrive
+	// Brief initial pause to populate cache
 	time.Sleep(500 * time.Millisecond)
 
 	http.HandleFunc("/", handleIndex)
@@ -111,7 +111,7 @@ func getConfig() ([]string, string) {
 	if err == nil {
 		cfgPath := filepath.Join(home, ".local", "pkgdash.config")
 		if file, err := os.Open(cfgPath); err == nil {
-			defer file.Close()
+			defer func() { _ = file.Close() }()
 			scanner := bufio.NewScanner(file)
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
@@ -169,12 +169,12 @@ func fetchAllData(servers []string, psk string) {
 
 			resp, err := client.Do(req)
 			if err != nil || resp.StatusCode != 200 { return }
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			var reader io.Reader = resp.Body
 			if resp.Header.Get("Content-Encoding") == "gzip" {
 				if gz, err := gzip.NewReader(resp.Body); err == nil {
-					defer gz.Close()
+					defer func() { _ = gz.Close() }()
 					reader = gz
 				}
 			}
@@ -223,11 +223,12 @@ func fetchAllData(servers []string, psk string) {
 // --- HTTP Handlers ---
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	tmpl.ExecuteTemplate(w, "index", map[string]interface{}{
+	_ = tmpl.ExecuteTemplate(w, "index", map[string]interface{}{
 		"LastUpdated": lastUpdated.Local().Format("15:04:05"),
 	})
 }
 
+// filterAndSort filters and sorts all matching records in memory.
 func filterAndSort(r *http.Request) ([]FlatItem, int, int) {
 	dataMutex.RLock()
 	defer dataMutex.RUnlock()
@@ -292,14 +293,13 @@ func handleTable(w http.ResponseWriter, r *http.Request) {
 		page = p
 	}
 
-	// 1000 rows ensures massive data can be browsed quickly without rapid-fire ajax calls
-	pageSize := 1000
+	pageSize := 1000 // Batch size for HTMX infinite scrolling
 
 	start := (page - 1) * pageSize
 	end := start + pageSize
 
 	if start >= len(filtered) && len(filtered) > 0 {
-		return
+		return // Reached end of record set
 	}
 	if end > len(filtered) {
 		end = len(filtered)
@@ -342,9 +342,9 @@ func handleTable(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if page > 1 {
-		tmpl.ExecuteTemplate(w, "table_rows", data)
+		_ = tmpl.ExecuteTemplate(w, "table_rows", data)
 	} else {
-		tmpl.ExecuteTemplate(w, "table", data)
+		_ = tmpl.ExecuteTemplate(w, "table", data)
 	}
 }
 
@@ -359,7 +359,7 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	dataMutex.RUnlock()
-	tmpl.ExecuteTemplate(w, "modal_host", host)
+	_ = tmpl.ExecuteTemplate(w, "modal_host", host)
 }
 
 func handleDiffModal(w http.ResponseWriter, r *http.Request) {
@@ -372,7 +372,7 @@ func handleDiffModal(w http.ResponseWriter, r *http.Request) {
 	for h := range hostMap { hosts = append(hosts, h) }
 	sort.Strings(hosts)
 
-	tmpl.ExecuteTemplate(w, "modal_diff", map[string]interface{}{"Hosts": hosts})
+	_ = tmpl.ExecuteTemplate(w, "modal_diff", map[string]interface{}{"Hosts": hosts})
 }
 
 func handleDiffResults(w http.ResponseWriter, r *http.Request) {
@@ -382,11 +382,11 @@ func handleDiffResults(w http.ResponseWriter, r *http.Request) {
 	diffOnly := r.URL.Query().Get("diffOnly") == "on"
 
 	if hostA == "" || hostB == "" {
-		w.Write([]byte(`<div class="text-pink text-center mt-3" style="text-align:center; margin-top:1rem;">Please select Host A and Host B to compare.</div>`))
+		_, _ = w.Write([]byte(`<div class="text-pink text-center mt-3" style="text-align:center; margin-top:1rem;">Please select Host A and Host B to compare.</div>`))
 		return
 	}
 	if hostA == hostB {
-		w.Write([]byte(`<div class="text-pink text-center mt-3" style="text-align:center; margin-top:1rem;">Please select two different hosts.</div>`))
+		_, _ = w.Write([]byte(`<div class="text-pink text-center mt-3" style="text-align:center; margin-top:1rem;">Please select two different hosts.</div>`))
 		return
 	}
 
@@ -426,25 +426,25 @@ func handleDiffResults(w http.ResponseWriter, r *http.Request) {
 
 	stats := fmt.Sprintf("📊 Comparison: %d differences out of %d total packages", diffCount, len(allPkgs))
 
-	tmpl.ExecuteTemplate(w, "diff_table", map[string]interface{}{
+	_ = tmpl.ExecuteTemplate(w, "diff_table", map[string]interface{}{
 		"HostA": hostA, "HostB": hostB, "Rows": rows, "Stats": stats,
 	})
 }
 
 func handleExportCSV(w http.ResponseWriter, r *http.Request) {
-	filtered, _, _ := filterAndSort(r) // Exports bypass pagination entirely
+	filtered, _, _ := filterAndSort(r) // Bypasses pagination to export all matches
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", "attachment;filename=pkgdash_export.csv")
 	writer := csv.NewWriter(w)
-	writer.Write([]string{"Hostname", "Package", "Version", "Architecture"})
+	_ = writer.Write([]string{"Hostname", "Package", "Version", "Architecture"})
 	for _, i := range filtered {
-		writer.Write([]string{i.Hostname, i.PkgName, i.Version, i.Arch})
+		_ = writer.Write([]string{i.Hostname, i.PkgName, i.Version, i.Arch})
 	}
 	writer.Flush()
 }
 
 func handleExportINI(w http.ResponseWriter, r *http.Request) {
-	filtered, _, _ := filterAndSort(r) // Exports bypass pagination entirely
+	filtered, _, _ := filterAndSort(r) // Bypasses pagination to export all matches
 	hostMap := make(map[string]bool)
 	for _, item := range filtered {
 		if item.Hostname != "" { hostMap[item.Hostname] = true }
@@ -455,13 +455,13 @@ func handleExportINI(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Content-Disposition", "attachment;filename=inventory.ini")
-	w.Write([]byte("[all]\n"))
+	_, _ = w.Write([]byte("[all]\n"))
 	for _, h := range hosts {
-		w.Write([]byte(h + "\n"))
+		_, _ = w.Write([]byte(h + "\n"))
 	}
 }
 
-// --- Regex Matcher (Ported from Go TUI) ---
+// --- Regex Matcher ---
 func createFieldMatcher(query string) func(string) bool {
 	if query == "" { return func(s string) bool { return true } }
 	if isLikelyRegex(query) {
@@ -497,7 +497,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pkgdash Web</title>
-    <!-- Simple box SVG Favicon -->
+    <!-- Embedded SVG Favicon -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
@@ -508,7 +508,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             --yellow: #F1FA8C; --dark-text: #11111B;
         }
 
-        /* Unified Flex Layout to guarantee perfect 1rem spacing gaps between boxes */
+        /* Unified Flex Layout to guarantee 1rem spacing gaps between boxes */
         body {
             background: var(--bg);
             color: var(--text);
@@ -540,12 +540,12 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 
         #filter-form { margin: 0; }
 
-        /* Main table takes all leftover space and gets a native scrollbar */
+        /* Main table container fills remaining viewport space */
         #table-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0; position: relative; }
 
         table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 
-        /* Sticky headers ensure context is always visible during scroll */
+        /* Sticky table headers */
         th {
             background: var(--surface);
             color: var(--text);
@@ -643,7 +643,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         <div style="text-align: center; margin-bottom: 2rem;">
             Designed & Developed by Chris van Meer<br>
             High-Performance Fleet Package Inventory (Web Edition)<br>
-            <span class="text-muted">© 2024 • All rights reserved</span>
+            <span class="text-muted">© 2026 • All rights reserved</span>
         </div>
         <div style="text-align: center;"><button onclick="this.closest('dialog').close()">[Close]</button></div>
     </dialog>
