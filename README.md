@@ -10,8 +10,16 @@
 
 ## 📸 Screenshot
 
+### TUI
+
 <p align="center">
   <img src="assets/pkgdash.png" alt="pkgdash TUI Screenshot" width="100%">
+</p>
+
+### GUI
+
+<p align="center">
+  <img src="assets/pkgdash-web.png" alt="pkgdash GUI Screenshot" width="100%">
 </p>
 
 ---
