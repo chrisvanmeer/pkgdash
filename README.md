@@ -163,6 +163,7 @@ nomad job run pkgdash-web.nomad.hcl
 ```
 
 The specification features:
+
 * Pre-configured Docker driver pointing to `ghcr.io/chrisvanmeer/pkgdash-web:latest`.
 * Graceful shutdown delays (`shutdown_delay = "15s"`) and rolling update strategies.
 * Optional Vault Workload Identity secret template rendering (`secrets/env`).
