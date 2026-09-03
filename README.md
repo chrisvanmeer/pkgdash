@@ -43,7 +43,7 @@ Ensure you have **Go 1.20+** installed on your system.
 
 ```bash
 # Clone the repository
-git clone [https://github.com/chrisvanmeer/pkgdash.git](https://github.com/chrisvanmeer/pkgdash.git)
+git clone https://github.com/chrisvanmeer/pkgdash.git
 cd pkgdash
 
 # Install dependencies and build binaries
@@ -89,7 +89,7 @@ Configure target servers using environment variables or a configuration file.
 #### Environment Variables
 
 ```bash
-export PKGDASH_SERVERS="[https://pkgdash.internal.domain:9876](https://pkgdash.internal.domain:9876),192.168.1.50:9876"
+export PKGDASH_SERVERS="https://pkgdash.internal.domain:9876,192.168.1.50:9876"
 export PKGDASH_PSK="your-secret-key"
 
 ./pkgdash
@@ -101,7 +101,7 @@ Alternatively, create `~/.local/pkgdash.config`:
 
 ```ini
 # Servers to query
-[https://pkgdash.internal.domain:9876](https://pkgdash.internal.domain:9876)
+https://pkgdash.internal.domain:9876
 192.168.1.50:9876
 
 # Pre-Shared Key
@@ -123,7 +123,7 @@ You can run `pkgdash-web` directly as a standalone binary or via Docker.
 #### Direct Execution
 
 ```bash
-export PKGDASH_SERVERS="[https://pkgdash.internal.domain:9876](https://pkgdash.internal.domain:9876)"
+export PKGDASH_SERVERS="https://pkgdash.internal.domain:9876"
 export PKGDASH_PSK="your-secret-key"
 export PKGDASH_WEB_PORT=":8080" # Optional, defaults to :8080
 
