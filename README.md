@@ -33,13 +33,13 @@
 * **Security First:** Built-in auto-TLS generation and PSK header authentication (`X-PSK`).
 * **One-Command Service Setup:** Self-installing systemd integration built right into the daemon binary.
 * **Data Export:** Export filtered inventory directly to CSV (`pkgdash_output.csv`) or Ansible inventory (`temp_inventory.ini`).
-* **Container Ready:** Includes multi-stage `Dockerfile` and `docker-compose.yml` for `pkgdash-web`.
+* **Container & Orchestration Ready:** Includes multi-stage `Dockerfile`, `docker-compose.yml`, and HashiCorp Nomad jobspec (`pkgdash-web.nomad.hcl`).
 
 ---
 
 ## 🚀 Installation & Building
 
-Ensure you have **Go 1.20+** installed on your system.
+Ensure you have **Go 1.24+** installed on your system.
 
 ```bash
 # Clone the repository
@@ -118,7 +118,7 @@ Then run simply:
 
 ### 3. Running the Web Client (`pkgdash-web`)
 
-You can run `pkgdash-web` directly as a standalone binary or via Docker.
+You can run `pkgdash-web` directly as a standalone binary, via Docker, or orchestrated with HashiCorp Nomad.
 
 #### Direct Execution
 
@@ -143,6 +143,22 @@ docker compose up -d --build
 # View logs
 docker compose logs -f
 ```
+
+#### Running via HashiCorp Nomad
+
+Deploy `pkgdash-web` to a Nomad cluster using the included `pkgdash-web.nomad.hcl` job specification:
+
+```bash
+# Plan and deploy the Nomad job
+nomad job plan pkgdash-web.nomad.hcl
+nomad job run pkgdash-web.nomad.hcl
+```
+
+The specification features:
+* Pre-configured Docker driver pointing to `ghcr.io/chrisvanmeer/pkgdash-web:latest`.
+* Graceful shutdown delays (`shutdown_delay = "15s"`) and rolling update strategies.
+* Optional Vault Workload Identity secret template rendering (`secrets/env`).
+* Optional Consul service registration and Traefik reverse proxy routing tags.
 
 ---
 
