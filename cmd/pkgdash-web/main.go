@@ -92,9 +92,10 @@ func main() {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/table", handleTable)
 	http.HandleFunc("/modal/host", handleHostModal)
+	http.HandleFunc("/modal/host/history", handleHostHistoryModal)
 	http.HandleFunc("/modal/package/history", handlePackageHistoryModal)
-	http.HandleFunc("/modal/diff", handleDiffModal)
 	http.HandleFunc("/modal/timeline", handleTimelineModal)
+	http.HandleFunc("/modal/diff", handleDiffModal)
 	http.HandleFunc("/diff/results", handleDiffResults)
 	http.HandleFunc("/export/csv", handleExportCSV)
 	http.HandleFunc("/export/ini", handleExportINI)
@@ -246,7 +247,7 @@ func fetchAllData(servers []string, psk string) {
 func fetchHistoryFromDaemons(hostname, pkgName string) []ChangeEvent {
 	var allEvents []ChangeEvent
 	customTransport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	client := http.Client{Timeout: 10 * time.Second, Transport: customTransport}
+	client := http.Client{Timeout: 5 * time.Second, Transport: customTransport}
 
 	dataMutex.RLock()
 	servers, psk := serversConfig, pskConfig
@@ -297,12 +298,19 @@ func fetchHistoryFromDaemons(hostname, pkgName string) []ChangeEvent {
 	sort.Slice(allEvents, func(i, j int) bool {
 		return allEvents[i].Timestamp.After(allEvents[j].Timestamp)
 	})
+
 	return allEvents
 }
 
 // --- HTTP Handlers ---
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
+	// Guard against unmatched routes returning index HTML to HTMX
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
 	isSecure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 	secStatus := "🔓 HTTP"
 	if isSecure {
@@ -397,10 +405,6 @@ func handleTable(w http.ResponseWriter, r *http.Request) {
 		end = len(filtered)
 	}
 
-	if page > 1 {
-		log.Printf("Serving Infinite Scroll: Page %d (Rows %d to %d)\n", page, start, end)
-	}
-
 	var displayItems []FlatItem
 	if len(filtered) > 0 {
 		displayItems = filtered[start:end]
@@ -456,6 +460,15 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 	_ = tmpl.ExecuteTemplate(w, "modal_host", host)
 }
 
+func handleHostHistoryModal(w http.ResponseWriter, r *http.Request) {
+	hostname := r.URL.Query().Get("h")
+	events := fetchHistoryFromDaemons(hostname, "")
+	_ = tmpl.ExecuteTemplate(w, "modal_host_history", map[string]interface{}{
+		"Hostname": hostname,
+		"Events":   events,
+	})
+}
+
 func handlePackageHistoryModal(w http.ResponseWriter, r *http.Request) {
 	hostname := r.URL.Query().Get("h")
 	pkgName := r.URL.Query().Get("p")
@@ -496,11 +509,7 @@ func handleDiffResults(w http.ResponseWriter, r *http.Request) {
 	filter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("filter")))
 	diffOnly := r.URL.Query().Get("diffOnly") == "on"
 
-	if hostA == "" || hostB == "" {
-		_, _ = w.Write([]byte(`<div class="text-pink text-center mt-3" style="text-align:center; margin-top:1rem;">Please select Host A and Host B to compare.</div>`))
-		return
-	}
-	if hostA == hostB {
+	if hostA == "" || hostB == "" || hostA == hostB {
 		_, _ = w.Write([]byte(`<div class="text-pink text-center mt-3" style="text-align:center; margin-top:1rem;">Please select two different hosts.</div>`))
 		return
 	}
@@ -594,7 +603,6 @@ func handleExportINI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- Regex Matcher ---
 func createFieldMatcher(query string) func(string) bool {
 	if query == "" {
 		return func(s string) bool { return true }
@@ -674,10 +682,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .panel { border: 2px solid var(--border); border-radius: 8px; padding: 0.5rem; }
         .header-panel { border-color: var(--purple); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
         .badge { padding: 0.1rem 0.5rem; font-weight: bold; color: var(--dark-text); display: inline-block; margin-right: 0.5rem; }
-        .bg-purple { background: var(--purple); }
-        .bg-cyan { background: var(--cyan); }
-        .bg-green { background: var(--green); }
-        .bg-yellow { background: var(--yellow); }
+        .bg-purple { background: var(--purple); } 
+        .bg-cyan { background: var(--cyan); } 
+        .bg-green { background: var(--green); } 
+        .bg-yellow { background: var(--yellow); } 
         .bg-red { background: var(--red); color: white; }
 
         .flex { display: flex; gap: 1rem; flex-shrink: 0; }
@@ -745,6 +753,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .history-table { width: 100%; font-size: 13px; border-collapse: collapse; table-layout: fixed; }
         .history-table th { background: var(--surface); padding: 0.5rem; text-align: left; border-bottom: 2px solid var(--border); }
         .history-table td { padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--surface); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .history-table tbody tr:hover td { background: var(--pink); color: var(--dark-text); cursor: pointer; }
     </style>
 </head>
 <body>
@@ -828,6 +837,28 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             const params = new URLSearchParams(formData).toString();
             window.location.href = endpoint + '?' + params;
         }
+
+        // Global Keyboard Shortcuts (Ctrl+Y, Ctrl+D, Ctrl+S, Ctrl+E)
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey || e.metaKey) {
+                const key = e.key.toLowerCase();
+                if (key === 'y') {
+                    e.preventDefault();
+                    htmx.ajax('GET', '/modal/timeline', {target: '#timeline-dialog-content'});
+                    document.getElementById('timelineModal').showModal();
+                } else if (key === 'd') {
+                    e.preventDefault();
+                    htmx.ajax('GET', '/modal/diff', {target: '#diff-dialog-content'});
+                    document.getElementById('diffModal').showModal();
+                } else if (key === 's') {
+                    e.preventDefault();
+                    exportFile('/export/csv');
+                } else if (key === 'e') {
+                    e.preventDefault();
+                    exportFile('/export/ini');
+                }
+            }
+        });
 
         // Handle Table Sorting
         document.body.addEventListener('click', function(evt) {
@@ -913,7 +944,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 
 {{define "modal_host"}}
     <div class="modal-header"><span class="badge bg-purple" style="text-transform: uppercase;"> HOST INFORMATION: {{.Hostname}} </span></div>
-
+    
     <div style="margin-bottom: 1.5rem; text-align: center;">
         <button class="tab-btn active" onclick="document.getElementById('tab-overview').style.display='block'; document.getElementById('tab-history').style.display='none'; this.classList.add('active'); this.nextElementSibling.classList.remove('active');">Overview</button>
         <button class="tab-btn" hx-get="/modal/host/history?h={{.Hostname}}" hx-target="#tab-history" onclick="document.getElementById('tab-overview').style.display='none'; document.getElementById('tab-history').style.display='block'; this.classList.add('active'); this.previousElementSibling.classList.remove('active');">Change History</button>
@@ -968,7 +999,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 
 {{define "modal_timeline"}}
     <div class="modal-header"><span class="badge bg-purple"> 📜 FLEET AUDIT LOG / TIME TRAVEL </span></div>
-
+    
     <div style="max-height: 500px; overflow-y: auto;">
         {{if .}}
         <table class="history-table">
@@ -1008,7 +1039,13 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 {{end}}
 
 {{define "modal_package_history"}}
-    <div class="modal-header"><span class="badge bg-purple"> 📦 PACKAGE TIMELINE: {{.Package}} on {{.Hostname}} </span></div>
+    <div class="modal-header">
+        <span class="badge bg-purple"> 📦 PACKAGE TIMELINE: {{.Package}} on {{.Hostname}} </span>
+    </div>
+
+    <div style="margin-bottom: 1rem;">
+        <button class="tab-btn" hx-get="/modal/host/history?h={{.Hostname}}" hx-target="#host-dialog-content">&larr; Back to Host History</button>
+    </div>
 
     <div style="max-height: 400px; overflow-y: auto;">
         <table class="history-table">
@@ -1016,7 +1053,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
                 <tr>
                     <th style="width:200px;">TIMESTAMP</th>
                     <th style="width:140px;">ACTION</th>
-                    <th>VERSION CHANGE</th>
+                    <th>VERSION CHANGE DETAILS</th>
                 </tr>
             </thead>
             <tbody>
