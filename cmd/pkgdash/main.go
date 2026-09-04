@@ -65,6 +65,15 @@ type DiffRow struct {
 	IsDiff   bool
 }
 
+type ChangeEvent struct {
+	Timestamp  time.Time `json:"timestamp"`
+	Hostname   string    `json:"hostname"`
+	Package    string    `json:"package"`
+	OldVersion string    `json:"old_version,omitempty"`
+	NewVersion string    `json:"new_version,omitempty"`
+	Action     string    `json:"action"` // "ADDED", "REMOVED", "MODIFIED"
+}
+
 type SortColumn int
 
 const (
@@ -80,6 +89,7 @@ var (
 	cPink     = lipgloss.Color("#FF79C6")
 	cGreen    = lipgloss.Color("#50FA7B")
 	cYellow   = lipgloss.Color("#F1FA8C")
+	cRed      = lipgloss.Color("#FF5555")
 	cHeaderBg = lipgloss.Color("#313244")
 	cMuted    = lipgloss.Color("#6C7086")
 	cText     = lipgloss.Color("#CDD6F4")
@@ -119,6 +129,24 @@ var (
 			Background(cGreen).
 			Padding(0, 1).
 			Bold(true)
+
+	actionAddedBadge = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#11111B")).
+				Background(cGreen).
+				Padding(0, 1).
+				Bold(true)
+
+	actionModifiedBadge = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#11111B")).
+				Background(cCyan).
+				Padding(0, 1).
+				Bold(true)
+
+	actionRemovedBadge = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#11111B")).
+				Background(cRed).
+				Padding(0, 1).
+				Bold(true)
 
 	metaStyle = lipgloss.NewStyle().
 			Foreground(cMuted).
@@ -188,7 +216,15 @@ type dataMsg struct {
 	isDone    bool
 }
 
+type historyDataMsg struct {
+	events []ChangeEvent
+	isHost bool
+}
+
 type model struct {
+	servers []string
+	psk     string
+
 	hostInput    textinput.Model
 	pkgInput     textinput.Model
 	verInput     textinput.Model
@@ -210,6 +246,18 @@ type model struct {
 	showAboutModal bool
 	showHostModal  bool
 	selectedHost   FlatItem
+	hostModalTab   int // 0: Overview, 1: History
+
+	// Fleet History (Time Travel)
+	showHistoryView bool
+	historyEvents   []ChangeEvent
+	historyCursor   int
+	historyOffset   int
+
+	// Host History Events
+	hostHistoryEvents []ChangeEvent
+	hostHistoryCursor int
+	hostHistoryOffset int
 
 	// Diff Selection Modal
 	showDiffSelectModal bool
@@ -255,7 +303,6 @@ func main() {
 	vi.Placeholder = PlaceholderVer
 	vi.Prompt = ""
 
-	// Diff Select Inputs
 	diffA := textinput.New()
 	diffA.Placeholder = "Type hostname or pattern for Host A..."
 	diffA.Prompt = ""
@@ -264,7 +311,6 @@ func main() {
 	diffB.Placeholder = "Type hostname or pattern for Host B..."
 	diffB.Prompt = ""
 
-	// Diff Filter Input
 	diffF := textinput.New()
 	diffF.Placeholder = "Filter compared packages..."
 	diffF.Prompt = ""
@@ -280,6 +326,8 @@ func main() {
 	}
 
 	m := model{
+		servers:         servers,
+		psk:             psk,
 		hostInput:       hi,
 		pkgInput:        pi,
 		verInput:        vi,
@@ -443,6 +491,59 @@ func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
 	}()
 }
 
+func fetchHistoryCmd(servers []string, psk string, hostname string) tea.Cmd {
+	return func() tea.Msg {
+		var allEvents []ChangeEvent
+		customTransport := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		client := http.Client{
+			Timeout:   5 * time.Second,
+			Transport: customTransport,
+		}
+
+		for _, s := range servers {
+			url := s
+			if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+				url = "http://" + url
+			}
+
+			cleanURL := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
+			if !strings.Contains(cleanURL, ":") {
+				url += ":9876"
+			}
+			url += "/history"
+			if hostname != "" {
+				url += "?host=" + hostname
+			}
+
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				continue
+			}
+			if psk != "" {
+				req.Header.Set("X-PSK", psk)
+			}
+
+			resp, err := client.Do(req)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				continue
+			}
+
+			var evts []ChangeEvent
+			if err := json.NewDecoder(resp.Body).Decode(&evts); err == nil {
+				allEvents = append(allEvents, evts...)
+			}
+			_ = resp.Body.Close()
+		}
+
+		return historyDataMsg{
+			events: allEvents,
+			isHost: hostname != "",
+		}
+	}
+}
+
 func waitForUpdate(sub chan dataMsg) tea.Cmd {
 	return func() tea.Msg { return <-sub }
 }
@@ -522,6 +623,46 @@ func (m *model) updateViewport() {
 		m.offset = m.cursor
 	} else if m.cursor >= m.offset+m.visibleLines {
 		m.offset = m.cursor - m.visibleLines + 1
+	}
+}
+
+func (m *model) updateHistoryViewport() {
+	if len(m.historyEvents) == 0 {
+		m.historyCursor = 0
+		m.historyOffset = 0
+		return
+	}
+
+	if m.historyCursor < 0 {
+		m.historyCursor = 0
+	} else if m.historyCursor >= len(m.historyEvents) {
+		m.historyCursor = len(m.historyEvents) - 1
+	}
+
+	if m.historyCursor < m.historyOffset {
+		m.historyOffset = m.historyCursor
+	} else if m.historyCursor >= m.historyOffset+m.visibleLines {
+		m.historyOffset = m.historyCursor - m.visibleLines + 1
+	}
+}
+
+func (m *model) updateHostHistoryViewport() {
+	if len(m.hostHistoryEvents) == 0 {
+		m.hostHistoryCursor = 0
+		m.hostHistoryOffset = 0
+		return
+	}
+
+	if m.hostHistoryCursor < 0 {
+		m.hostHistoryCursor = 0
+	} else if m.hostHistoryCursor >= len(m.hostHistoryEvents) {
+		m.hostHistoryCursor = len(m.hostHistoryEvents) - 1
+	}
+
+	if m.hostHistoryCursor < m.hostHistoryOffset {
+		m.hostHistoryOffset = m.hostHistoryCursor
+	} else if m.hostHistoryCursor >= m.hostHistoryOffset+5 {
+		m.hostHistoryOffset = m.hostHistoryCursor - 5 + 1
 	}
 }
 
@@ -761,16 +902,98 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewport()
 
 		return m, waitForUpdate(m.updateChan)
+
+	case historyDataMsg:
+		if msg.isHost {
+			m.hostHistoryEvents = msg.events
+			m.hostHistoryCursor = 0
+			m.hostHistoryOffset = 0
+		} else {
+			m.historyEvents = msg.events
+			m.historyCursor = 0
+			m.historyOffset = 0
+		}
+		return m, nil
 	}
 
-	// 1. About or Host Detail Modals
+	// 1. Fleet History (Time Travel) View
+	if m.showHistoryView {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc", "ctrl+y":
+				m.showHistoryView = false
+				return m, nil
+
+			case "up", "ctrl+k":
+				m.historyCursor--
+				m.updateHistoryViewport()
+				return m, nil
+
+			case "down", "ctrl+j":
+				m.historyCursor++
+				m.updateHistoryViewport()
+				return m, nil
+
+			case "pgup":
+				m.historyCursor -= m.visibleLines
+				m.updateHistoryViewport()
+				return m, nil
+
+			case "pgdown":
+				m.historyCursor += m.visibleLines
+				m.updateHistoryViewport()
+				return m, nil
+			}
+
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+			m.updateHistoryViewport()
+		}
+		return m, nil
+	}
+
+	// 2. About or Host Detail Modals
 	if m.showAboutModal || m.showHostModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.String() {
-			case "esc", "enter", "ctrl+c":
+			case "esc", "ctrl+c":
 				m.showAboutModal = false
 				m.showHostModal = false
+				return m, nil
+
+			case "enter":
+				if m.showAboutModal {
+					m.showAboutModal = false
+				} else {
+					m.showHostModal = false
+				}
+				return m, nil
+
+			case "tab", "shift+tab":
+				if m.showHostModal {
+					m.hostModalTab = (m.hostModalTab + 1) % 2
+					if m.hostModalTab == 1 && len(m.hostHistoryEvents) == 0 {
+						return m, fetchHistoryCmd(m.servers, m.psk, m.selectedHost.Hostname)
+					}
+				}
+				return m, nil
+
+			case "up", "ctrl+k":
+				if m.showHostModal && m.hostModalTab == 1 {
+					m.hostHistoryCursor--
+					m.updateHostHistoryViewport()
+				}
+				return m, nil
+
+			case "down", "ctrl+j":
+				if m.showHostModal && m.hostModalTab == 1 {
+					m.hostHistoryCursor++
+					m.updateHostHistoryViewport()
+				}
+				return m, nil
 			}
 		case tea.WindowSizeMsg:
 			m.width = msg.Width
@@ -779,7 +1002,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 2. Diff Host Selection Modal
+	// 3. Diff Host Selection Modal
 	if m.showDiffSelectModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -857,7 +1080,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// 3. Diff View Modal
+	// 4. Diff View Modal
 	if m.showDiffViewModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -916,7 +1139,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// 4. Main View Keyboard Navigation
+	// 5. Main View Keyboard Navigation
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" {
@@ -930,11 +1153,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				m.selectedHost = m.filtered[m.cursor]
 				m.showHostModal = true
+				m.hostModalTab = 0
+				m.hostHistoryEvents = nil
 			}
 			return m, nil
 		case "ctrl+c":
 			m.showAboutModal = true
 			return m, nil
+		case "ctrl+y":
+			m.showHistoryView = true
+			return m, fetchHistoryCmd(m.servers, m.psk, "")
 		case "ctrl+s":
 			m.flashMsg = saveCSV(m.filtered)
 			return m, nil
@@ -1153,6 +1381,19 @@ func (m *model) getFleetInsights() string {
 		filterTag, selectedPkg, len(hostMap), len(versionMap))
 }
 
+func renderActionBadge(action string) string {
+	switch strings.ToUpper(action) {
+	case "ADDED":
+		return actionAddedBadge.Render(" + ADDED ")
+	case "MODIFIED":
+		return actionModifiedBadge.Render(" ~ MODIFIED ")
+	case "REMOVED":
+		return actionRemovedBadge.Render(" - REMOVED ")
+	default:
+		return actionModifiedBadge.Render(" " + action + " ")
+	}
+}
+
 func truncate(str string, maxLen int) string {
 	if maxLen <= 0 {
 		return ""
@@ -1188,7 +1429,80 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 2. Host Detail Modal
+	// 2. Fleet History View (Ctrl+Y)
+	if m.showHistoryView {
+		innerWidth := m.width - 10
+		if innerWidth < 60 {
+			innerWidth = 60
+		}
+
+		titleBar := titleBadge.Render(" 📜 FLEET AUDIT LOG / TIME TRAVEL ")
+
+		start := m.historyOffset
+		end := m.historyOffset + m.visibleLines
+		if end > len(m.historyEvents) {
+			end = len(m.historyEvents)
+		}
+
+		var rowStrs []string
+		if len(m.historyEvents) == 0 {
+			rowStrs = append(rowStrs, lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render(" No package change history recorded yet."))
+		} else {
+			viewport := m.historyEvents[start:end]
+			for i, evt := range viewport {
+				absIndex := start + i
+				isSelected := absIndex == m.historyCursor
+
+				badge := renderActionBadge(evt.Action)
+				timeStr := evt.Timestamp.Local().Format("2006-01-02 15:04")
+
+				details := fmt.Sprintf("%s -> %s", evt.OldVersion, evt.NewVersion)
+				if evt.Action == "ADDED" {
+					details = evt.NewVersion
+				} else if evt.Action == "REMOVED" {
+					details = evt.OldVersion
+				}
+
+				line := fmt.Sprintf("[%s] %s  %s  %s  (%s)",
+					timeStr,
+					lipgloss.NewStyle().Foreground(cCyan).Render(evt.Hostname),
+					badge,
+					lipgloss.NewStyle().Foreground(cText).Bold(true).Render(evt.Package),
+					details,
+				)
+
+				if isSelected {
+					line = selectedStyle.Width(innerWidth).Render(truncate("❯ "+line, innerWidth))
+				} else {
+					line = truncate("  "+line, innerWidth)
+				}
+
+				rowStrs = append(rowStrs, line)
+			}
+		}
+
+		for i := len(rowStrs); i < m.visibleLines; i++ {
+			rowStrs = append(rowStrs, "")
+		}
+
+		historyBody := strings.Join(rowStrs, "\n")
+		frame := panelStyle.BorderForeground(cPurple).Width(innerWidth + 4).Render(historyBody)
+
+		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Esc / Ctrl+Y] Close History View")
+
+		content := lipgloss.JoinVertical(lipgloss.Center,
+			titleBar,
+			"",
+			frame,
+			"",
+			helpText,
+		)
+
+		dialog := modalStyle.Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+	}
+
+	// 3. Host Detail Modal (With Overview vs History Tabs)
 	if m.showHostModal {
 		osStr := strings.TrimSpace(m.selectedHost.OSName + " " + m.selectedHost.OSVersion)
 		if osStr == "" {
@@ -1203,27 +1517,78 @@ func (m model) View() string {
 			ipStr = "Onbekend"
 		}
 
-		hostTitle := fmt.Sprintf(" HOST INFORMATION: %s ", m.selectedHost.Hostname)
+		tabOverviewStyle := labelBlurred
+		tabHistoryStyle := labelBlurred
+		if m.hostModalTab == 0 {
+			tabOverviewStyle = labelFocused
+		} else {
+			tabHistoryStyle = labelFocused
+		}
 
-		details := lipgloss.JoinVertical(lipgloss.Left,
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Hostname:      "), rowStyleNormal.Render(m.selectedHost.Hostname)),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("IP Address:    "), rowStyleNormal.Render(ipStr)),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("OS:            "), rowStyleNormal.Render(osStr)),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Host Function: "), rowStyleNormal.Render(fnStr)),
+		tabs := lipgloss.JoinHorizontal(lipgloss.Center,
+			tabOverviewStyle.Render("[1] Host Overview"),
+			"   |   ",
+			tabHistoryStyle.Render("[2] Change History"),
 		)
+
+		hostTitle := fmt.Sprintf(" HOST: %s ", m.selectedHost.Hostname)
+
+		var bodyContent string
+		if m.hostModalTab == 0 {
+			bodyContent = lipgloss.JoinVertical(lipgloss.Left,
+				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Hostname:      "), rowStyleNormal.Render(m.selectedHost.Hostname)),
+				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("IP Address:    "), rowStyleNormal.Render(ipStr)),
+				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("OS:            "), rowStyleNormal.Render(osStr)),
+				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Host Function: "), rowStyleNormal.Render(fnStr)),
+			)
+		} else {
+			if len(m.hostHistoryEvents) == 0 {
+				bodyContent = lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render("No package changes recorded for this host.")
+			} else {
+				start := m.hostHistoryOffset
+				end := m.hostHistoryOffset + 5
+				if end > len(m.hostHistoryEvents) {
+					end = len(m.hostHistoryEvents)
+				}
+
+				var rows []string
+				viewport := m.hostHistoryEvents[start:end]
+				for i, evt := range viewport {
+					absIdx := start + i
+					badge := renderActionBadge(evt.Action)
+					timeStr := evt.Timestamp.Local().Format("01-02 15:04")
+
+					details := fmt.Sprintf("%s -> %s", evt.OldVersion, evt.NewVersion)
+					if evt.Action == "ADDED" {
+						details = evt.NewVersion
+					} else if evt.Action == "REMOVED" {
+						details = evt.OldVersion
+					}
+
+					line := fmt.Sprintf("[%s] %s %s (%s)", timeStr, badge, evt.Package, details)
+					if absIdx == m.hostHistoryCursor {
+						line = selectedStyle.Render(line)
+					}
+					rows = append(rows, line)
+				}
+				bodyContent = strings.Join(rows, "\n")
+			}
+		}
 
 		modalContent := lipgloss.JoinVertical(lipgloss.Center,
 			titleBadge.Render(hostTitle),
 			"",
-			details,
+			tabs,
 			"",
-			lipgloss.NewStyle().Foreground(cMuted).Render("[Press Esc or Enter to close]"),
+			bodyContent,
+			"",
+			lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Tab  |  [Esc / Enter] Close"),
 		)
 		dialog := modalStyle.Render(modalContent)
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 3. Diff Selection Modal with Styled Typeahead
+	// 4. Diff Selection Modal with Styled Typeahead
 	if m.showDiffSelectModal {
 		titleBar := titleBadge.Render(" ⚔️ COMPARE HOST PACKAGES (DIFF) ")
 
@@ -1278,7 +1643,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 4. Diff View Modal
+	// 5. Diff View Modal
 	if m.showDiffViewModal {
 		modalOuterW := m.width - 10
 		if modalOuterW < 70 {
@@ -1422,7 +1787,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 5. Main Dashboard View
+	// 6. Main Dashboard View
 	availWidth := m.width - 2
 	if availWidth < 60 {
 		return "Terminal window too small..."
@@ -1611,7 +1976,7 @@ func (m model) View() string {
 		displayStart = start + 1
 	}
 
-	keyHelp := "[Enter] Info  |  [Ctrl+D] Diff  |  [Ctrl+E] Export INI  |  [Ctrl+S] Export CSV  |  [Tab] Switch"
+	keyHelp := "[Enter] Info  |  [Ctrl+Y] History  |  [Ctrl+D] Diff  |  [Ctrl+S] CSV  |  [Tab] Switch"
 	counterText := fmt.Sprintf("Records: %d-%d / %d (Total: %d)", displayStart, end, len(m.filtered), len(m.allItems))
 
 	footerText := fmt.Sprintf("%s  •  %s", keyHelp, counterText)

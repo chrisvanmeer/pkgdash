@@ -54,6 +54,15 @@ type DiffRow struct {
 	IsDiff   bool
 }
 
+type ChangeEvent struct {
+	Timestamp  time.Time `json:"timestamp"`
+	Hostname   string    `json:"hostname"`
+	Package    string    `json:"package"`
+	OldVersion string    `json:"old_version,omitempty"`
+	NewVersion string    `json:"new_version,omitempty"`
+	Action     string    `json:"action"` // "ADDED", "REMOVED", "MODIFIED"
+}
+
 var (
 	globalItems   []FlatItem
 	lastUpdated   time.Time
@@ -83,7 +92,9 @@ func main() {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/table", handleTable)
 	http.HandleFunc("/modal/host", handleHostModal)
+	http.HandleFunc("/modal/host/history", handleHostHistoryModal)
 	http.HandleFunc("/modal/diff", handleDiffModal)
+	http.HandleFunc("/modal/timeline", handleTimelineModal)
 	http.HandleFunc("/diff/results", handleDiffResults)
 	http.HandleFunc("/export/csv", handleExportCSV)
 	http.HandleFunc("/export/ini", handleExportINI)
@@ -228,6 +239,57 @@ func fetchAllData(servers []string, psk string) {
 	}
 }
 
+func fetchHistoryFromDaemons(hostname string) []ChangeEvent {
+	var allEvents []ChangeEvent
+	customTransport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	client := http.Client{Timeout: 10 * time.Second, Transport: customTransport}
+
+	dataMutex.RLock()
+	servers := serversConfig
+	psk := pskConfig
+	dataMutex.RUnlock()
+
+	for _, s := range servers {
+		url := s
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			url = "http://" + url
+		}
+		cleanURL := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
+		if !strings.Contains(cleanURL, ":") {
+			url += ":9876"
+		}
+		url += "/history"
+		if hostname != "" {
+			url += "?host=" + hostname
+		}
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
+		if psk != "" {
+			req.Header.Set("X-PSK", psk)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+
+		var evts []ChangeEvent
+		if err := json.NewDecoder(resp.Body).Decode(&evts); err == nil {
+			allEvents = append(allEvents, evts...)
+		}
+		_ = resp.Body.Close()
+	}
+
+	sort.Slice(allEvents, func(i, j int) bool {
+		return allEvents[i].Timestamp.After(allEvents[j].Timestamp)
+	})
+
+	return allEvents
+}
+
 // --- HTTP Handlers ---
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -243,7 +305,6 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// filterAndSort filters and sorts all matching records in memory.
 func filterAndSort(r *http.Request) ([]FlatItem, int, int) {
 	dataMutex.RLock()
 	defer dataMutex.RUnlock()
@@ -314,13 +375,13 @@ func handleTable(w http.ResponseWriter, r *http.Request) {
 		page = p
 	}
 
-	pageSize := 1000 // Batch size for HTMX infinite scrolling
+	pageSize := 1000
 
 	start := (page - 1) * pageSize
 	end := start + pageSize
 
 	if start >= len(filtered) && len(filtered) > 0 {
-		return // Reached end of record set
+		return
 	}
 	if end > len(filtered) {
 		end = len(filtered)
@@ -382,7 +443,22 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	dataMutex.RUnlock()
+
 	_ = tmpl.ExecuteTemplate(w, "modal_host", host)
+}
+
+func handleHostHistoryModal(w http.ResponseWriter, r *http.Request) {
+	hostname := r.URL.Query().Get("h")
+	events := fetchHistoryFromDaemons(hostname)
+	_ = tmpl.ExecuteTemplate(w, "modal_host_history", map[string]interface{}{
+		"Hostname": hostname,
+		"Events":   events,
+	})
+}
+
+func handleTimelineModal(w http.ResponseWriter, r *http.Request) {
+	events := fetchHistoryFromDaemons("")
+	_ = tmpl.ExecuteTemplate(w, "modal_timeline", events)
 }
 
 func handleDiffModal(w http.ResponseWriter, r *http.Request) {
@@ -473,7 +549,7 @@ func handleDiffResults(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleExportCSV(w http.ResponseWriter, r *http.Request) {
-	filtered, _, _ := filterAndSort(r) // Bypasses pagination to export all matches
+	filtered, _, _ := filterAndSort(r)
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", "attachment;filename=pkgdash_export.csv")
 	writer := csv.NewWriter(w)
@@ -485,7 +561,7 @@ func handleExportCSV(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleExportINI(w http.ResponseWriter, r *http.Request) {
-	filtered, _, _ := filterAndSort(r) // Bypasses pagination to export all matches
+	filtered, _, _ := filterAndSort(r)
 	hostMap := make(map[string]bool)
 	for _, item := range filtered {
 		if item.Hostname != "" {
@@ -506,7 +582,6 @@ func handleExportINI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- Regex Matcher ---
 func createFieldMatcher(query string) func(string) bool {
 	if query == "" {
 		return func(s string) bool { return true }
@@ -542,9 +617,11 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 	"isRegex": func(q string) string {
 		if isLikelyRegex(q) {
 			return "[REG]"
-		} else {
-			return "[TXT]"
 		}
+		return "[TXT]"
+	},
+	"formatTime": func(t time.Time) string {
+		return t.Local().Format("2006-01-02 15:04")
 	},
 }).Parse(`
 {{define "index"}}
@@ -554,7 +631,6 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pkgdash Web</title>
-    <!-- Embedded SVG Favicon -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
@@ -562,10 +638,9 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             --bg: #1e1e2e; --surface: #313244; --border: #45475A;
             --text: #CDD6F4; --muted: #6C7086; --purple: #7D56F4;
             --cyan: #04D9D9; --pink: #FF79C6; --green: #50FA7B;
-            --yellow: #F1FA8C; --dark-text: #11111B;
+            --yellow: #F1FA8C; --red: #FF5555; --dark-text: #11111B;
         }
 
-        /* Unified Flex Layout to guarantee 1rem spacing gaps between boxes */
         body {
             background: var(--bg);
             color: var(--text);
@@ -584,7 +659,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .panel { border: 2px solid var(--border); border-radius: 8px; padding: 0.5rem; }
         .header-panel { border-color: var(--purple); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
         .badge { padding: 0.1rem 0.5rem; font-weight: bold; color: var(--dark-text); display: inline-block; margin-right: 0.5rem; }
-        .bg-purple { background: var(--purple); } .bg-cyan { background: var(--cyan); } .bg-green { background: var(--green); } .bg-yellow { background: var(--yellow); }
+        .bg-purple { background: var(--purple); } .bg-cyan { background: var(--cyan); } .bg-green { background: var(--green); } .bg-yellow { background: var(--yellow); } .bg-red { background: var(--red); color: white; }
 
         .flex { display: flex; gap: 1rem; flex-shrink: 0; }
         .filter-card { flex: 1; border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; transition: border 0.2s; }
@@ -596,13 +671,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         input[type="text"] { background: transparent; border: none; color: var(--text); font-family: inherit; width: 100%; outline: none; margin-left: 0.5rem; }
 
         #filter-form { margin: 0; }
-
-        /* Main table container fills remaining viewport space */
         #table-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0; position: relative; }
 
         table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 
-        /* Sticky table headers */
         th {
             background: var(--surface);
             color: var(--text);
@@ -625,29 +697,30 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .btn-link { color: var(--muted); text-decoration: none; cursor: pointer; padding: 0 0.5rem; }
         .btn-link:hover { color: var(--pink); }
 
-        /* Modals */
         dialog { background: var(--bg); color: var(--text); border: 3px double var(--purple); border-radius: 8px; padding: 1.5rem; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        dialog#diffModal { max-width: 1100px; }
+        dialog#diffModal, dialog#timelineModal { max-width: 1100px; }
         dialog#aboutModal, dialog#hostModal { max-width: 800px; }
         dialog::backdrop { background: rgba(0,0,0,0.7); }
         .modal-header { font-weight: bold; margin-bottom: 1rem; text-align: center; }
         .text-pink { color: var(--pink); } .text-cyan { color: var(--cyan); }
         select { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 0.3rem; font-family: inherit; width: 100%; margin-bottom: 1rem; outline: none; }
-		button { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 0.4rem 1rem; cursor: pointer; font-family: inherit; }
-		button:hover { background: var(--pink); color: var(--dark-text); }
+        button { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 0.4rem 1rem; cursor: pointer; font-family: inherit; }
+        button:hover { background: var(--pink); color: var(--dark-text); }
 
-		/* Diff Table specific */
+        .tab-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 0.3rem 0.8rem; margin-right: 0.5rem; cursor: pointer; }
+        .tab-btn.active { border-color: var(--pink); color: var(--pink); font-weight: bold; }
+
         .diff-table { font-size: 13px; }
-		.diff-table th { background: var(--bg); border-bottom: 2px solid var(--border); box-shadow: none; }
-		.diff-table td { border-bottom: 1px solid #313244; }
-		.diff-table tr.is-diff td.diff-col { font-weight: bold; }
-		.diff-table tr.is-diff td.diff-col-a { color: var(--cyan); }
-		.diff-table tr.is-diff td.diff-col-b { color: var(--pink); }
+        .diff-table th { background: var(--bg); border-bottom: 2px solid var(--border); box-shadow: none; }
+        .diff-table td { border-bottom: 1px solid #313244; }
+        .diff-table tr.is-diff td.diff-col { font-weight: bold; }
+        .diff-table tr.is-diff td.diff-col-a { color: var(--cyan); }
+        .diff-table tr.is-diff td.diff-col-b { color: var(--pink); }
     </style>
 </head>
 <body>
 
-		<!-- Header Panel -->
+    <!-- Header Panel -->
     <div class="panel header-panel">
         <div>
             <span class="badge bg-purple"> 📦 PKGDASH-WEB </span>
@@ -687,6 +760,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <div class="footer">
         <div>
             <a class="btn-link" onclick="document.getElementById('aboutModal').showModal()">[About]</a> |
+            <a class="btn-link" hx-get="/modal/timeline" hx-target="#timeline-dialog-content" onclick="document.getElementById('timelineModal').showModal()">[Ctrl+Y] Timeline</a> |
             <a class="btn-link" hx-get="/modal/diff" hx-target="#diff-dialog-content" onclick="document.getElementById('diffModal').showModal()">[Ctrl+D] Diff</a> |
             <a class="btn-link" href="#" onclick="exportFile('/export/ini')">[Ctrl+E] Export INI</a> |
             <a class="btn-link" href="#" onclick="exportFile('/export/csv')">[Ctrl+S] Export CSV</a>
@@ -714,6 +788,11 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         <div id="diff-dialog-content"></div>
     </dialog>
 
+    <dialog id="timelineModal">
+        <div id="timeline-dialog-content"></div>
+        <div style="text-align: center; margin-top: 1rem;"><button onclick="this.closest('dialog').close()">[Close]</button></div>
+    </dialog>
+
     <script>
         function exportFile(endpoint) {
             const formData = new FormData(document.getElementById('filter-form'));
@@ -721,7 +800,6 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             window.location.href = endpoint + '?' + params;
         }
 
-        // Handle Table Sorting
         document.body.addEventListener('click', function(evt) {
             if (evt.target.matches('th[data-sort]')) {
                 const sortInput = document.getElementById('sort-col');
@@ -738,7 +816,6 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             }
         });
 
-        // Regex indicator updater
         document.querySelectorAll('input[type="text"]').forEach(input => {
             input.addEventListener('input', (e) => {
                 const isReg = /[\\^\$\*\+\?\[\]\(\)\{\}\|]/.test(e.target.value);
@@ -747,15 +824,14 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             });
         });
 
-		// Modal Close on click outside
-		document.querySelectorAll('dialog').forEach(dialog => {
-			dialog.addEventListener('click', (e) => {
-				const rect = dialog.getBoundingClientRect();
-				if(e.clientY < rect.top || e.clientY > rect.bottom || e.clientX < rect.left || e.clientX > rect.right) {
-					dialog.close();
-				}
-			});
-		});
+        document.querySelectorAll('dialog').forEach(dialog => {
+            dialog.addEventListener('click', (e) => {
+                const rect = dialog.getBoundingClientRect();
+                if(e.clientY < rect.top || e.clientY > rect.bottom || e.clientX < rect.left || e.clientX > rect.right) {
+                    dialog.close();
+                }
+            });
+        });
     </script>
 </body>
 </html>
@@ -805,11 +881,97 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 
 {{define "modal_host"}}
     <div class="modal-header"><span class="badge bg-purple" style="text-transform: uppercase;"> HOST INFORMATION: {{.Hostname}} </span></div>
-    <div style="margin-left: 2rem; line-height: 1.8;">
+    
+    <div style="margin-bottom: 1rem; text-align: center;">
+        <button class="tab-btn active" onclick="document.getElementById('tab-overview').style.display='block'; document.getElementById('tab-history').style.display='none'; this.classList.add('active'); this.nextElementSibling.classList.remove('active');">Overview</button>
+        <button class="tab-btn" hx-get="/modal/host/history?h={{.Hostname}}" hx-target="#tab-history" onclick="document.getElementById('tab-overview').style.display='none'; document.getElementById('tab-history').style.display='block'; this.classList.add('active'); this.previousElementSibling.classList.remove('active');">Change History</button>
+    </div>
+
+    <div id="tab-overview" style="margin-left: 2rem; line-height: 1.8;">
         <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">Hostname:</span> {{.Hostname}}</div>
         <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">IP Address:</span> {{if .IPAddress}}{{.IPAddress}}{{else}}Unknown{{end}}</div>
         <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">OS:</span> {{if .OSName}}{{.OSName}} {{.OSVersion}}{{else}}Unknown{{end}}</div>
         <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">Host Function:</span> {{if .HostFunction}}{{.HostFunction}}{{else}}-{{end}}</div>
+    </div>
+
+    <div id="tab-history" style="display:none; max-height: 300px; overflow-y: auto;">
+        <!-- Loaded via HTMX -->
+    </div>
+{{end}}
+
+{{define "modal_host_history"}}
+    {{if .Events}}
+    <table style="width:100%; font-size:12px;">
+        <thead>
+            <tr style="border-bottom: 1px solid var(--border);">
+                <th style="width:120px;">Timestamp</th>
+                <th style="width:90px;">Action</th>
+                <th>Package</th>
+                <th>Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Events}}
+            <tr>
+                <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
+                <td>
+                    {{if eq .Action "ADDED"}}<span class="badge bg-green">+ ADDED</span>{{end}}
+                    {{if eq .Action "MODIFIED"}}<span class="badge bg-cyan">~ MODIFIED</span>{{end}}
+                    {{if eq .Action "REMOVED"}}<span class="badge bg-red">- REMOVED</span>{{end}}
+                </td>
+                <td style="font-weight:bold;">{{.Package}}</td>
+                <td style="color:var(--muted);">
+                    {{if eq .Action "ADDED"}}{{.NewVersion}}{{end}}
+                    {{if eq .Action "MODIFIED"}}{{.OldVersion}} &rarr; {{.NewVersion}}{{end}}
+                    {{if eq .Action "REMOVED"}}{{.OldVersion}}{{end}}
+                </td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+    {{else}}
+    <div style="text-align:center; padding: 1rem; color:var(--muted); font-style:italic;">No package change history recorded for this host.</div>
+    {{end}}
+{{end}}
+
+{{define "modal_timeline"}}
+    <div class="modal-header"><span class="badge bg-purple"> 📜 FLEET AUDIT LOG / TIME TRAVEL </span></div>
+    
+    <div style="max-height: 450px; overflow-y: auto;">
+        {{if .}}
+        <table style="width:100%; font-size:13px;">
+            <thead style="position:sticky; top:0; background:var(--bg);">
+                <tr style="border-bottom: 2px solid var(--border);">
+                    <th style="width:140px;">Timestamp</th>
+                    <th style="width:180px;">Host</th>
+                    <th style="width:100px;">Action</th>
+                    <th>Package</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .}}
+                <tr>
+                    <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
+                    <td class="text-cyan" style="font-weight:bold;">{{.Hostname}}</td>
+                    <td>
+                        {{if eq .Action "ADDED"}}<span class="badge bg-green">+ ADDED</span>{{end}}
+                        {{if eq .Action "MODIFIED"}}<span class="badge bg-cyan">~ MODIFIED</span>{{end}}
+                        {{if eq .Action "REMOVED"}}<span class="badge bg-red">- REMOVED</span>{{end}}
+                    </td>
+                    <td style="font-weight:bold;">{{.Package}}</td>
+                    <td style="color:var(--muted);">
+                        {{if eq .Action "ADDED"}}{{.NewVersion}}{{end}}
+                        {{if eq .Action "MODIFIED"}}{{.OldVersion}} &rarr; {{.NewVersion}}{{end}}
+                        {{if eq .Action "REMOVED"}}{{.OldVersion}}{{end}}
+                    </td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
+        {{else}}
+        <div style="text-align:center; padding: 2rem; color:var(--muted); font-style:italic;">No package change events recorded yet across the fleet.</div>
+        {{end}}
     </div>
 {{end}}
 

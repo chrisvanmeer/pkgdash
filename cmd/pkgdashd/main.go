@@ -33,6 +33,8 @@ const (
 var (
 	activeDataPath string
 	activePSK      string
+	historyMgr     *HistoryManager
+	previousState  = make(map[string]map[string]string)
 )
 
 // Cache structures
@@ -91,7 +93,11 @@ func main() {
 		return
 	}
 
+	// Initialize History Manager
+	historyMgr = NewHistoryManager(activeDataPath)
+
 	http.HandleFunc("/packages", handlePackages)
+	http.HandleFunc("/history", handleHistory)
 	log.Printf("Starting pkgdashd listener on port %s, serving data from %s...", *portFlag, activeDataPath)
 
 	if *tlsFlag {
@@ -129,8 +135,12 @@ func loadDataWithCache() ([]byte, []byte, time.Time, error) {
 
 	var newestTime time.Time
 	var allHosts []HostPayload
+	currentState := make(map[string]map[string]string)
 
 	for _, file := range files {
+		if strings.HasSuffix(file, "history.json") || strings.HasSuffix(file, "history.jsonl") {
+			continue
+		}
 		if info, err := os.Stat(file); err == nil && info.ModTime().After(newestTime) {
 			newestTime = info.ModTime()
 		}
@@ -141,8 +151,25 @@ func loadDataWithCache() ([]byte, []byte, time.Time, error) {
 		var hosts []HostPayload
 		if err := json.Unmarshal(data, &hosts); err == nil {
 			allHosts = append(allHosts, hosts...)
+			for _, h := range hosts {
+				if currentState[h.Hostname] == nil {
+					currentState[h.Hostname] = make(map[string]string)
+				}
+				for _, pkg := range h.Packages {
+					currentState[h.Hostname][pkg.Name] = pkg.Version
+				}
+			}
 		}
 	}
+
+	// Calculate diffs and log changes
+	if historyMgr != nil {
+		diffs := ComputeDiffs(previousState, currentState)
+		if len(diffs) > 0 {
+			historyMgr.RecordChanges(diffs)
+		}
+	}
+	previousState = currentState
 
 	rawJSON, err := json.Marshal(allHosts)
 	if err != nil {
@@ -192,6 +219,24 @@ func handlePackages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = w.Write(rawJSON)
+}
+
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	if activePSK != "" {
+		if r.Header.Get("X-PSK") != activePSK {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	// Dynamic trigger to ensure fresh scan state before returning history
+	_, _, _, _ = loadDataWithCache()
+
+	hostname := r.URL.Query().Get("host")
+	events := historyMgr.GetHistory(hostname, 100)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(events)
 }
 
 func ensureTLSCerts(certPath, keyPath string) error {
