@@ -256,18 +256,19 @@ type model struct {
 	verInput     textinput.Model
 	focusedInput int
 
-	allItems     []FlatItem
-	filtered     []FlatItem
-	lastUpdated  time.Time
-	width        int
-	height       int
-	ready        bool
-	loaded       bool
-	sortCol      SortColumn
-	sortDesc     bool
-	offset       int
-	cursor       int
-	visibleLines int
+	allItems      []FlatItem
+	filtered      []FlatItem
+	lastUpdated   time.Time
+	width         int
+	height        int
+	ready         bool
+	loaded        bool
+	sortCol       SortColumn
+	sortDesc      bool
+	offset        int
+	cursor        int
+	visibleLines  int
+	showOnlyVulns bool
 
 	showAboutModal bool
 	showHostModal  bool
@@ -389,6 +390,7 @@ func main() {
 		hasTLS:          hasTLS,
 		hasPSK:          psk != "",
 		diffOnlyDiffs:   false,
+		showOnlyVulns:   false,
 	}
 
 	go fetchAllDataAsync(servers, psk, updateChan)
@@ -1340,13 +1342,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// 7. Main View Keyboard Navigation
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" && msg.String() != "ctrl+o" {
+		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" && msg.String() != "ctrl+o" && msg.String() != "ctrl+u" {
 			m.flashMsg = ""
 		}
 
 		switch msg.String() {
 		case "esc":
 			return m, tea.Quit
+		case "ctrl+u":
+			if !m.hasOSV {
+				m.flashMsg = "OSV integration disabled on daemon"
+				return m, nil
+			}
+			m.showOnlyVulns = !m.showOnlyVulns
+			m.filterItems()
+			m.cursor = 0
+			m.updateViewport()
+			if m.showOnlyVulns {
+				m.flashMsg = "Filter active: vulnerable packages only"
+			} else {
+				m.flashMsg = "Showing all packages"
+			}
+			return m, nil
+
 		case "ctrl+o":
 			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				item := m.filtered[m.cursor]
@@ -1518,7 +1536,7 @@ func (m *model) filterItems() {
 	pQuery := strings.TrimSpace(m.pkgInput.Value())
 	vQuery := strings.TrimSpace(m.verInput.Value())
 
-	if hQuery == "" && pQuery == "" && vQuery == "" {
+	if hQuery == "" && pQuery == "" && vQuery == "" && !m.showOnlyVulns {
 		m.filtered = m.allItems
 		return
 	}
@@ -1529,6 +1547,9 @@ func (m *model) filterItems() {
 
 	var filtered []FlatItem
 	for _, item := range m.allItems {
+		if m.showOnlyVulns && len(item.Vulnerabilities) == 0 {
+			continue
+		}
 		if hMatch(item.Hostname) && pMatch(item.PkgName) && vMatch(item.Version) {
 			filtered = append(filtered, item)
 		}
@@ -1683,7 +1704,6 @@ func (m model) View() string {
 				prefix = "❯ "
 			}
 
-			// Clean fallback for singular OSV URLs
 			cleanURL := strings.Replace(v.URL, "https://osv.dev/vulnerabilities/", "https://osv.dev/vulnerability/", 1)
 
 			detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render(prefix+"ID/CVE:  "), lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(cveStr)))
@@ -2471,7 +2491,11 @@ func (m model) View() string {
 
 	keyHelp := "[Enter] Info  |  [Ctrl+Y] History  |  [Ctrl+D] Diff  |  [Ctrl+S] CSV  |  [Tab] Switch"
 	if m.hasOSV {
-		keyHelp = "[Ctrl+O] OSV Advisory  |  " + keyHelp
+		vulnTag := "[Ctrl+U] Vulns Only"
+		if m.showOnlyVulns {
+			vulnTag = "[Ctrl+U] Vulns Only [ACTIVE]"
+		}
+		keyHelp = vulnTag + "  |  [Ctrl+O] OSV Advisory  |  " + keyHelp
 	}
 	counterText := fmt.Sprintf("Records: %d-%d / %d (Total: %d)", displayStart, end, len(m.filtered), len(m.allItems))
 
