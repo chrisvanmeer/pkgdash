@@ -11,10 +11,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -150,11 +148,6 @@ var (
 			Padding(0, 1).
 			Bold(true)
 
-	cveBadge = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(cRed).
-			Bold(true)
-
 	actionAddedBadge = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#11111B")).
 				Background(cGreen).
@@ -210,11 +203,17 @@ var (
 				Bold(true)
 
 	rowStyleNormal = lipgloss.NewStyle().Foreground(cText)
+	vulnRowStyle   = lipgloss.NewStyle().Foreground(cRed)
 
 	selectedStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#11111B")).
 			Background(cPink).
 			Bold(true)
+
+	selectedVulnStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#11111B")).
+				Background(cRed).
+				Bold(true)
 
 	selectedDiffStyle = selectedStyle
 
@@ -275,6 +274,14 @@ type model struct {
 	selectedHost   FlatItem
 	hostModalTab   int // 0: Overview, 1: History
 
+	// OSV Vulnerability Scrollable Detail Modal
+	showOSVModal     bool
+	selectedOSVPkg   string
+	selectedOSVVer   string
+	selectedOSVVulns []Vulnerability
+	osvModalCursor   int
+	osvModalOffset   int
+
 	// Per-Package Chronological Timeline Modal
 	showPackageHistoryModal bool
 	packageHistoryEvents    []ChangeEvent
@@ -318,23 +325,6 @@ type model struct {
 	hasTLS     bool
 	hasPSK     bool
 	hasOSV     bool
-}
-
-func openURL(url string) error {
-	var cmd string
-	var args []string
-	switch runtime.GOOS {
-	case "windows":
-		cmd = "cmd"
-		args = []string{"/c", "start", url}
-	case "darwin":
-		cmd = "open"
-		args = []string{url}
-	default:
-		cmd = "xdg-open"
-		args = []string{url}
-	}
-	return exec.Command(cmd, args...).Start()
 }
 
 func main() {
@@ -755,6 +745,27 @@ func (m *model) updatePackageHistoryViewport() {
 	}
 }
 
+func (m *model) updateOSVModalViewport() {
+	if len(m.selectedOSVVulns) == 0 {
+		m.osvModalCursor = 0
+		m.osvModalOffset = 0
+		return
+	}
+
+	if m.osvModalCursor < 0 {
+		m.osvModalCursor = 0
+	} else if m.osvModalCursor >= len(m.selectedOSVVulns) {
+		m.osvModalCursor = len(m.selectedOSVVulns) - 1
+	}
+
+	visibleItems := 3
+	if m.osvModalCursor < m.osvModalOffset {
+		m.osvModalOffset = m.osvModalCursor
+	} else if m.osvModalCursor >= m.osvModalOffset+visibleItems {
+		m.osvModalOffset = m.osvModalCursor - visibleItems + 1
+	}
+}
+
 func (m *model) getUniqueHosts() []string {
 	hostMap := make(map[string]bool)
 	for _, item := range m.allItems {
@@ -1016,7 +1027,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 1. Per-Package Chronological History Modal
+	// 1. OSV Vulnerability Detail Modal (Fully Scrollable & Strictly Bounded)
+	if m.showOSVModal {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc", "enter", "ctrl+c", "ctrl+o", "q":
+				m.showOSVModal = false
+				return m, nil
+
+			case "up", "ctrl+k", "k":
+				m.osvModalCursor--
+				m.updateOSVModalViewport()
+				return m, nil
+
+			case "down", "ctrl+j", "j":
+				m.osvModalCursor++
+				m.updateOSVModalViewport()
+				return m, nil
+
+			case "pgup":
+				m.osvModalCursor -= 3
+				m.updateOSVModalViewport()
+				return m, nil
+
+			case "pgdown":
+				m.osvModalCursor += 3
+				m.updateOSVModalViewport()
+				return m, nil
+			}
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+		}
+		return m, nil
+	}
+
+	// 2. Per-Package Chronological History Modal
 	if m.showPackageHistoryModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1042,7 +1089,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 2. Fleet History (Time Travel) View (Ctrl+Y)
+	// 3. Fleet History (Time Travel) View (Ctrl+Y)
 	if m.showHistoryView {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1087,7 +1134,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 3. About or Host Detail Modals
+	// 4. About or Host Detail Modals
 	if m.showAboutModal || m.showHostModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1099,11 +1146,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "ctrl+o":
 				if m.showHostModal && len(m.selectedHost.Vulnerabilities) > 0 {
-					vuln := m.selectedHost.Vulnerabilities[0]
-					if vuln.URL != "" {
-						_ = openURL(vuln.URL)
-						m.flashMsg = fmt.Sprintf("Opened OSV details: %s", vuln.ID)
-					}
+					m.selectedOSVPkg = m.selectedHost.PkgName
+					m.selectedOSVVer = m.selectedHost.Version
+					m.selectedOSVVulns = m.selectedHost.Vulnerabilities
+					m.osvModalCursor = 0
+					m.osvModalOffset = 0
+					m.showOSVModal = true
 				}
 				return m, nil
 
@@ -1150,7 +1198,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 4. Diff Host Selection Modal
+	// 5. Diff Host Selection Modal
 	if m.showDiffSelectModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1228,7 +1276,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// 5. Diff View Modal
+	// 6. Diff View Modal
 	if m.showDiffViewModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1287,7 +1335,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// 6. Main View Keyboard Navigation
+	// 7. Main View Keyboard Navigation
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" && msg.String() != "ctrl+o" {
@@ -1300,16 +1348,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+o":
 			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				item := m.filtered[m.cursor]
-				if len(item.Vulnerabilities) > 0 && item.Vulnerabilities[0].URL != "" {
-					if err := openURL(item.Vulnerabilities[0].URL); err == nil {
-						m.flashMsg = fmt.Sprintf("Opened OSV URL for %s", item.PkgName)
-					} else {
-						m.flashMsg = fmt.Sprintf("Failed to open browser: %v", err)
-					}
+				if len(item.Vulnerabilities) > 0 {
+					m.selectedOSVPkg = item.PkgName
+					m.selectedOSVVer = item.Version
+					m.selectedOSVVulns = item.Vulnerabilities
+					m.osvModalCursor = 0
+					m.osvModalOffset = 0
+					m.showOSVModal = true
 				} else if !item.OSVEnabled && !m.hasOSV {
 					m.flashMsg = "OSV integration disabled on daemon"
 				} else {
-					m.flashMsg = "No vulnerability URL available for package"
+					m.flashMsg = "No vulnerabilities detected for this package"
 				}
 			}
 			return m, nil
@@ -1587,7 +1636,82 @@ func (m model) View() string {
 		return "Initializing Dashboard..."
 	}
 
-	// 1. Per-Package Chronological Timeline Modal
+	// 1. OSV Vulnerability Detail Modal (Strictly Bounded Width)
+	if m.showOSVModal {
+		modalContentWidth := m.width - 24
+		if modalContentWidth > 80 {
+			modalContentWidth = 80
+		}
+		if modalContentWidth < 50 {
+			modalContentWidth = 50
+		}
+
+		titleBar := titleBadge.Render(fmt.Sprintf(" 🛡 OSV ADVISORY: %s (%s) ", m.selectedOSVPkg, m.selectedOSVVer))
+
+		start := m.osvModalOffset
+		end := m.osvModalOffset + 3
+		if end > len(m.selectedOSVVulns) {
+			end = len(m.selectedOSVVulns)
+		}
+
+		viewport := m.selectedOSVVulns[start:end]
+
+		var detailLines []string
+		detailLines = append(detailLines, labelFocused.Render(fmt.Sprintf("Showing %d-%d of %d vulnerability record(s):", start+1, end, len(m.selectedOSVVulns))))
+		detailLines = append(detailLines, "")
+
+		for i, v := range viewport {
+			absIdx := start + i
+			isSelected := absIdx == m.osvModalCursor
+
+			cveStr := v.ID
+			if len(v.CVE) > 0 {
+				cveStr += " (" + strings.Join(v.CVE, ", ") + ")"
+			}
+
+			lblStyle := labelFocused
+			valStyle := rowStyleNormal
+			if isSelected {
+				lblStyle = selectedStyle
+				valStyle = selectedStyle
+			}
+
+			prefix := "  "
+			if isSelected {
+				prefix = "❯ "
+			}
+
+			// Clean fallback for singular OSV URLs
+			cleanURL := strings.Replace(v.URL, "https://osv.dev/vulnerabilities/", "https://osv.dev/vulnerability/", 1)
+
+			detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render(prefix+"ID/CVE:  "), lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(cveStr)))
+			if v.Summary != "" {
+				detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("  Summary: "), valStyle.Render(truncate(v.Summary, modalContentWidth-12))))
+			}
+			if cleanURL != "" {
+				detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("  Link:    "), lipgloss.NewStyle().Foreground(cCyan).Underline(true).Render(truncate(cleanURL, modalContentWidth-12))))
+			}
+			detailLines = append(detailLines, "")
+		}
+
+		body := lipgloss.JoinVertical(lipgloss.Left, detailLines...)
+		frame := panelStyle.BorderForeground(cRed).Width(modalContentWidth).Render(body)
+
+		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼ / PgUp/PgDown] Scroll Advisories  |  [Esc / Enter] Close Pop-up")
+
+		content := lipgloss.JoinVertical(lipgloss.Center,
+			titleBar,
+			"",
+			frame,
+			"",
+			helpText,
+		)
+
+		dialog := modalStyle.Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+	}
+
+	// 2. Per-Package Chronological Timeline Modal
 	if m.showPackageHistoryModal {
 		innerWidth := m.width - 12
 		if innerWidth < 70 {
@@ -1670,7 +1794,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 2. About Modal
+	// 3. About Modal
 	if m.showAboutModal {
 		modalContent := lipgloss.JoinVertical(lipgloss.Center,
 			titleBadge.Render(" PKGDASH CONTROL CENTER "),
@@ -1686,7 +1810,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 3. Fleet History View (Ctrl+Y)
+	// 4. Fleet History View (Ctrl+Y)
 	if m.showHistoryView {
 		innerWidth := m.width - 10
 		if innerWidth < 90 {
@@ -1783,11 +1907,11 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 4. Host Detail Modal (With Strictly Aligned Columns for History Tab)
+	// 5. Host Detail Modal (Left-aligned & Fixed Padding)
 	if m.showHostModal {
 		osStr := strings.TrimSpace(m.selectedHost.OSName + " " + m.selectedHost.OSVersion)
 		if osStr == "" {
-			osStr = "Onbekend"
+			osStr = "Unknown"
 		}
 		fnStr := m.selectedHost.HostFunction
 		if fnStr == "" {
@@ -1795,7 +1919,7 @@ func (m model) View() string {
 		}
 		ipStr := m.selectedHost.IPAddress
 		if ipStr == "" {
-			ipStr = "Onbekend"
+			ipStr = "Unknown"
 		}
 
 		tabOverviewStyle := labelBlurred
@@ -1806,13 +1930,20 @@ func (m model) View() string {
 			tabHistoryStyle = labelFocused
 		}
 
-		tabs := lipgloss.JoinHorizontal(lipgloss.Center,
+		tabs := lipgloss.JoinHorizontal(lipgloss.Left,
 			tabOverviewStyle.Render("[1] Host Overview"),
 			"   |   ",
 			tabHistoryStyle.Render("[2] Change History"),
 		)
 
 		hostTitle := fmt.Sprintf(" HOST: %s ", m.selectedHost.Hostname)
+
+		modalInnerWidth := m.width - 20
+		if modalInnerWidth < 74 {
+			modalInnerWidth = 74
+		}
+
+		lblStyle := labelFocused.Width(16)
 
 		var bodyContent string
 		if m.hostModalTab == 0 {
@@ -1821,24 +1952,28 @@ func (m model) View() string {
 				var ids []string
 				for _, v := range m.selectedHost.Vulnerabilities {
 					if len(v.CVE) > 0 {
-						ids = append(ids, strings.Join(v.CVE, ", "))
+						ids = append(ids, v.CVE[0])
 					} else {
 						ids = append(ids, v.ID)
 					}
 				}
-				vulnSummary = fmt.Sprintf("⚠️ %d flagged (%s)", len(m.selectedHost.Vulnerabilities), strings.Join(ids, ", "))
+				if len(ids) > 2 {
+					vulnSummary = fmt.Sprintf("⚠️ %d flagged (%s, +%d more)", len(m.selectedHost.Vulnerabilities), strings.Join(ids[:2], ", "), len(ids)-2)
+				} else {
+					vulnSummary = fmt.Sprintf("⚠️ %d flagged (%s)", len(m.selectedHost.Vulnerabilities), strings.Join(ids, ", "))
+				}
 			}
 
 			overviewLines := []string{
-				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Hostname:      "), rowStyleNormal.Render(m.selectedHost.Hostname)),
-				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("IP Address:    "), rowStyleNormal.Render(ipStr)),
-				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("OS:            "), rowStyleNormal.Render(osStr)),
-				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Host Function: "), rowStyleNormal.Render(fnStr)),
-				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Package:       "), rowStyleNormal.Render(m.selectedHost.PkgName+" "+m.selectedHost.Version)),
+				lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("Hostname:"), rowStyleNormal.Render(m.selectedHost.Hostname)),
+				lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("IP Address:"), rowStyleNormal.Render(ipStr)),
+				lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("OS:"), rowStyleNormal.Render(osStr)),
+				lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("Host Function:"), rowStyleNormal.Render(fnStr)),
+				lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("Package:"), rowStyleNormal.Render(m.selectedHost.PkgName+" "+m.selectedHost.Version)),
 			}
 
 			if m.selectedHost.OSVEnabled || m.hasOSV {
-				overviewLines = append(overviewLines, lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Security/CVE:  "), lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(vulnSummary)))
+				overviewLines = append(overviewLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("Security/CVE:"), lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(vulnSummary)))
 			}
 
 			bodyContent = strings.Join(overviewLines, "\n")
@@ -1891,23 +2026,30 @@ func (m model) View() string {
 
 		helpBar := "[Tab] Switch Tab  |  [Enter] Inspect Full Timeline  |  [Esc] Close"
 		if len(m.selectedHost.Vulnerabilities) > 0 {
-			helpBar = "[Ctrl+O] Open OSV Details  |  " + helpBar
+			helpBar = "[Ctrl+O] View OSV Advisory  |  " + helpBar
 		}
 
-		modalContent := lipgloss.JoinVertical(lipgloss.Center,
-			titleBadge.Render(hostTitle),
+		modalContent := lipgloss.JoinVertical(lipgloss.Left,
+			lipgloss.NewStyle().Width(modalInnerWidth).Align(lipgloss.Center).Render(titleBadge.Render(hostTitle)),
 			"",
-			tabs,
+			lipgloss.NewStyle().Width(modalInnerWidth).Align(lipgloss.Center).Render(tabs),
 			"",
 			bodyContent,
 			"",
-			lipgloss.NewStyle().Foreground(cMuted).Render(helpBar),
+			lipgloss.NewStyle().Width(modalInnerWidth).Align(lipgloss.Center).Render(lipgloss.NewStyle().Foreground(cMuted).Render(helpBar)),
 		)
-		dialog := modalStyle.Render(modalContent)
+
+		hostModalFrameStyle := lipgloss.NewStyle().
+			Border(lipgloss.DoubleBorder()).
+			BorderForeground(cPurple).
+			Padding(1, 3).
+			Align(lipgloss.Left)
+
+		dialog := hostModalFrameStyle.Render(modalContent)
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 5. Diff Selection Modal with Styled Typeahead
+	// 6. Diff Selection Modal with Styled Typeahead
 	if m.showDiffSelectModal {
 		titleBar := titleBadge.Render(" ⚔️ COMPARE HOST PACKAGES (DIFF) ")
 
@@ -1962,7 +2104,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 6. Diff View Modal
+	// 7. Diff View Modal
 	if m.showDiffViewModal {
 		modalOuterW := m.width - 10
 		if modalOuterW < 70 {
@@ -2106,7 +2248,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 7. Main Dashboard View
+	// 8. Main Dashboard View
 	availWidth := m.width - 2
 	if availWidth < 60 {
 		return "Terminal window too small..."
@@ -2125,7 +2267,7 @@ func (m model) View() string {
 
 	var osvBadgeStr string
 	if m.hasOSV {
-		osvBadgeStr = " " + osvBadgeStyle.Render("🛡️ OSV")
+		osvBadgeStr = osvBadgeStyle.Render("🛡 OSV")
 	}
 
 	var stBadge string
@@ -2141,7 +2283,13 @@ func (m model) View() string {
 	}
 	mText := metaStyle.Render(fmt.Sprintf("Updated: %s", timeStr))
 
-	leftBadges := lipgloss.JoinHorizontal(lipgloss.Center, tBadge, " ", sBadge, osvBadgeStr, " ", stBadge)
+	leftBadgesList := []string{tBadge, sBadge}
+	if osvBadgeStr != "" {
+		leftBadgesList = append(leftBadgesList, osvBadgeStr)
+	}
+	leftBadgesList = append(leftBadgesList, stBadge)
+
+	leftBadges := strings.Join(leftBadgesList, " ")
 	rightMeta := mText
 	if m.flashMsg != "" {
 		rightMeta = flashStyle.Render(m.flashMsg) + " " + mText
@@ -2259,6 +2407,7 @@ func (m model) View() string {
 	for i, item := range viewport {
 		absIndex := start + i
 		isSelected := absIndex == m.cursor
+		hasVuln := m.hasOSV && len(item.Vulnerabilities) > 0
 
 		rHostRaw := "  " + item.Hostname
 		if isSelected {
@@ -2266,25 +2415,32 @@ func (m model) View() string {
 		}
 
 		rPkgRaw := " " + item.PkgName
-		if m.hasOSV && len(item.Vulnerabilities) > 0 {
-			rPkgRaw += " ⚠️"
-		}
-
 		rVerRaw := " " + item.Version
+		if hasVuln {
+			rVerRaw += " ⚠️"
+		}
 
 		var rHost, rPkg, rVer string
 		if isSelected {
-			rHost = selectedStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
-			rPkg = selectedStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
-			rVer = selectedStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
-		} else {
-			rHost = rowStyleNormal.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
-			if m.hasOSV && len(item.Vulnerabilities) > 0 {
-				rPkg = lipgloss.NewStyle().Foreground(cRed).Bold(true).Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+			if hasVuln {
+				rHost = selectedVulnStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
+				rPkg = selectedVulnStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+				rVer = selectedVulnStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
 			} else {
-				rPkg = rowStyleNormal.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+				rHost = selectedStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
+				rPkg = selectedStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+				rVer = selectedStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
 			}
-			rVer = rowStyleNormal.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
+		} else {
+			if hasVuln {
+				rHost = vulnRowStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
+				rPkg = vulnRowStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+				rVer = vulnRowStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
+			} else {
+				rHost = rowStyleNormal.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
+				rPkg = rowStyleNormal.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+				rVer = rowStyleNormal.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
+			}
 		}
 
 		rowStrs = append(rowStrs, lipgloss.JoinHorizontal(lipgloss.Left, rHost, rPkg, rVer))
@@ -2310,7 +2466,7 @@ func (m model) View() string {
 
 	keyHelp := "[Enter] Info  |  [Ctrl+Y] History  |  [Ctrl+D] Diff  |  [Ctrl+S] CSV  |  [Tab] Switch"
 	if m.hasOSV {
-		keyHelp = "[Ctrl+O] Open OSV Link  |  " + keyHelp
+		keyHelp = "[Ctrl+O] OSV Advisory  |  " + keyHelp
 	}
 	counterText := fmt.Sprintf("Records: %d-%d / %d (Total: %d)", displayStart, end, len(m.filtered), len(m.allItems))
 

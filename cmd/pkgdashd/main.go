@@ -33,8 +33,9 @@ const (
 	serviceName      = "pkgdashd"
 	installDir       = "/usr/local/bin"
 	osvCacheTTL      = 12 * time.Hour
-	osvHTTPTimeout   = 15 * time.Second
-	osvBatchSize     = 500
+	osvHTTPTimeout   = 30 * time.Second
+	osvBatchSize     = 100
+	syncInterval     = 30 * time.Second
 )
 
 var (
@@ -52,6 +53,7 @@ var (
 	// OSV Cache
 	osvCacheMu sync.RWMutex
 	osvCache   = make(map[string]osvCacheEntry)
+	isScanning bool
 )
 
 type pkgKey struct {
@@ -60,11 +62,10 @@ type pkgKey struct {
 }
 
 type osvCacheEntry struct {
-	vulnerabilities []Vulnerability
-	fetchedAt       time.Time
+	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
+	FetchedAt       time.Time       `json:"fetched_at"`
 }
 
-// Cache structures for package payloads
 var (
 	cacheMu        sync.RWMutex
 	cachedRawJSON  []byte
@@ -98,7 +99,6 @@ type HostPayload struct {
 	OSVEnabled   bool          `json:"osv_enabled"`
 }
 
-// OSV Request/Response structs
 type osvQuery struct {
 	Package osvPackage `json:"package"`
 	Version string     `json:"version"`
@@ -141,10 +141,9 @@ func main() {
 	pskFlag := flag.String("psk", "", "Pre-shared key for authentication (optional)")
 	tlsFlag := flag.Bool("tls", false, "Enable TLS encryption (auto-generates certificates)")
 
-	// OSV Flags
 	osvEnableFlag := flag.Bool("enable-osv", defaultOSVEnable, "Enable OSV.dev vulnerability checking")
 	osvURLFlag := flag.String("osv-url", defaultOSVURL, "OSV API URL (or internal mirror)")
-	osvProxyFlag := flag.String("osv-proxy", defaultOSVProxy, "Proxy URL for OSV requests (e.g., http://proxy.internal:8080)")
+	osvProxyFlag := flag.String("osv-proxy", defaultOSVProxy, "Proxy URL for OSV requests")
 
 	flag.Parse()
 
@@ -153,11 +152,6 @@ func main() {
 	activeOSVEnabled = *osvEnableFlag
 	activeOSVURL = strings.TrimRight(*osvURLFlag, "/")
 	activeOSVProxy = *osvProxyFlag
-
-	if activeOSVEnabled {
-		initOSVHTTPClient()
-		log.Printf("OSV vulnerability integration ENABLED (API: %s)", activeOSVURL)
-	}
 
 	if *installFlag && *uninstallFlag {
 		log.Fatal("Cannot use --install and --uninstall at the same time")
@@ -179,8 +173,19 @@ func main() {
 		return
 	}
 
-	// Initialize History Manager
+	if activeOSVEnabled {
+		initOSVHTTPClient()
+		loadOSVCacheFromDisk()
+		log.Printf("OSV vulnerability integration ENABLED (API: %s)", activeOSVURL)
+	}
+
 	historyMgr = NewHistoryManager(activeDataPath)
+
+	// Perform initial fast scan (without waiting for OSV network requests)
+	refreshCache(false)
+
+	// Start background synchronization routine
+	go startBackgroundSync(syncInterval)
 
 	http.HandleFunc("/packages", handlePackages)
 	http.HandleFunc("/history", handleHistory)
@@ -222,21 +227,49 @@ func initOSVHTTPClient() {
 	}
 }
 
-func loadDataWithCache() ([]byte, []byte, time.Time, error) {
-	cacheMu.RLock()
-	if time.Since(lastCacheCheck) < 2*time.Second && cachedRawJSON != nil {
-		raw, gz, t := cachedRawJSON, cachedGzip, cachedModTime
-		cacheMu.RUnlock()
-		return raw, gz, t, nil
+func loadOSVCacheFromDisk() {
+	cacheFile := filepath.Join(activeDataPath, "osv_cache.json")
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return
 	}
-	cacheMu.RUnlock()
 
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
+	osvCacheMu.Lock()
+	defer osvCacheMu.Unlock()
+	_ = json.Unmarshal(data, &osvCache)
+	log.Printf("Loaded %d cached OSV package entries from disk", len(osvCache))
+}
 
+func saveOSVCacheToDisk() {
+	osvCacheMu.RLock()
+	defer osvCacheMu.RUnlock()
+
+	data, err := json.Marshal(osvCache)
+	if err != nil {
+		return
+	}
+
+	cacheFile := filepath.Join(activeDataPath, "osv_cache.json")
+	_ = os.WriteFile(cacheFile, data, 0640)
+}
+
+func startBackgroundSync(interval time.Duration) {
+	// First OSV background scan shortly after startup
+	time.Sleep(2 * time.Second)
+	if activeOSVEnabled {
+		refreshCache(true)
+	}
+
+	ticker := time.NewTicker(interval)
+	for range ticker.C {
+		refreshCache(activeOSVEnabled)
+	}
+}
+
+func refreshCache(fetchOSV bool) {
 	files, err := filepath.Glob(filepath.Join(activeDataPath, "*.json"))
 	if err != nil {
-		return nil, nil, time.Time{}, err
+		return
 	}
 
 	var newestTime time.Time
@@ -244,7 +277,7 @@ func loadDataWithCache() ([]byte, []byte, time.Time, error) {
 	currentState := make(map[string]map[string]string)
 
 	for _, file := range files {
-		if strings.HasSuffix(file, "history.json") || strings.HasSuffix(file, "history.jsonl") {
+		if strings.HasSuffix(file, "history.json") || strings.HasSuffix(file, "history.jsonl") || strings.HasSuffix(file, "osv_cache.json") {
 			continue
 		}
 		if info, err := os.Stat(file); err == nil && info.ModTime().After(newestTime) {
@@ -269,7 +302,6 @@ func loadDataWithCache() ([]byte, []byte, time.Time, error) {
 		}
 	}
 
-	// Calculate diffs and log changes
 	if historyMgr != nil {
 		diffs := ComputeDiffs(previousState, currentState)
 		if len(diffs) > 0 {
@@ -278,31 +310,61 @@ func loadDataWithCache() ([]byte, []byte, time.Time, error) {
 	}
 	previousState = currentState
 
-	// Fetch OSV vulnerabilities if enabled
+	// Fetch OSV vulnerabilities asynchronously
 	if activeOSVEnabled && len(allHosts) > 0 {
-		enrichWithOSV(allHosts)
+		if fetchOSV && !isScanning {
+			go func(h []HostPayload) {
+				isScanning = true
+				defer func() { isScanning = false }()
+				enrichWithOSV(h)
+				saveOSVCacheToDisk()
+				updatePayloadCache(h, newestTime)
+			}(allHosts)
+		} else {
+			// Attach existing cached OSV data without blocking
+			attachCachedOSV(allHosts)
+		}
 	}
 
+	updatePayloadCache(allHosts, newestTime)
+}
+
+func updatePayloadCache(allHosts []HostPayload, newestTime time.Time) {
 	rawJSON, err := json.Marshal(allHosts)
 	if err != nil {
-		return nil, nil, time.Time{}, err
+		return
 	}
 
 	var gzBuf bytes.Buffer
 	gzWriter := gzip.NewWriter(&gzBuf)
 	if _, err := gzWriter.Write(rawJSON); err != nil {
-		return nil, nil, time.Time{}, err
+		return
 	}
 	if err := gzWriter.Close(); err != nil {
-		return nil, nil, time.Time{}, err
+		return
 	}
 
+	cacheMu.Lock()
 	cachedRawJSON = rawJSON
 	cachedGzip = gzBuf.Bytes()
 	cachedModTime = newestTime
 	lastCacheCheck = time.Now()
+	cacheMu.Unlock()
+}
 
-	return cachedRawJSON, cachedGzip, cachedModTime, nil
+func attachCachedOSV(hosts []HostPayload) {
+	osvCacheMu.RLock()
+	defer osvCacheMu.RUnlock()
+
+	for i := range hosts {
+		for j := range hosts[i].Packages {
+			p := &hosts[i].Packages[j]
+			key := p.Name + "@" + p.Version
+			if entry, ok := osvCache[key]; ok && len(entry.Vulnerabilities) > 0 {
+				p.Vulnerabilities = entry.Vulnerabilities
+			}
+		}
+	}
 }
 
 func enrichWithOSV(hosts []HostPayload) {
@@ -315,39 +377,27 @@ func enrichWithOSV(hosts []HostPayload) {
 		}
 	}
 
-	// Filter packages that need OSV lookup
 	var toFetch []pkgKey
 	osvCacheMu.RLock()
 	for pk := range uniquePkgs {
 		key := pk.Name + "@" + pk.Version
 		entry, exists := osvCache[key]
-		if !exists || time.Since(entry.fetchedAt) > osvCacheTTL {
+		if !exists || time.Since(entry.FetchedAt) > osvCacheTTL {
 			toFetch = append(toFetch, pk)
 		}
 	}
 	osvCacheMu.RUnlock()
 
-	// Batch query OSV API
 	if len(toFetch) > 0 {
+		log.Printf("Querying OSV.dev API for %d packages...", len(toFetch))
 		fetchOSVBatch(toFetch)
 	}
 
-	// Attach results to hosts
-	osvCacheMu.RLock()
-	defer osvCacheMu.RUnlock()
-
-	for i := range hosts {
-		for j := range hosts[i].Packages {
-			p := &hosts[i].Packages[j]
-			key := p.Name + "@" + p.Version
-			if entry, ok := osvCache[key]; ok && len(entry.vulnerabilities) > 0 {
-				p.Vulnerabilities = entry.vulnerabilities
-			}
-		}
-	}
+	attachCachedOSV(hosts)
 }
 
 func fetchOSVBatch(pkgs []pkgKey) {
+	vulnCount := 0
 	for i := 0; i < len(pkgs); i += osvBatchSize {
 		end := i + osvBatchSize
 		if end > len(pkgs) {
@@ -407,9 +457,12 @@ func fetchOSVBatch(pkgs []pkgKey) {
 					}
 				}
 
-				vulnURL := fmt.Sprintf("https://osv.dev/vulnerabilities/%s", v.ID)
+				// Singular URL structure required by OSV.dev
+				vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", v.ID)
+
+				// Prefer vendor advisory / web link if available in references
 				for _, ref := range v.References {
-					if ref.URL != "" {
+					if (ref.Type == "ADVISORY" || ref.Type == "WEB") && strings.HasPrefix(ref.URL, "http") {
 						vulnURL = ref.URL
 						break
 					}
@@ -424,13 +477,18 @@ func fetchOSVBatch(pkgs []pkgKey) {
 				})
 			}
 
+			if len(vulns) > 0 {
+				vulnCount += len(vulns)
+			}
+
 			osvCache[key] = osvCacheEntry{
-				vulnerabilities: vulns,
-				fetchedAt:       now,
+				Vulnerabilities: vulns,
+				FetchedAt:       now,
 			}
 		}
 		osvCacheMu.Unlock()
 	}
+	log.Printf("OSV scan complete: found %d vulnerabilities across scanned packages", vulnCount)
 }
 
 func handlePackages(w http.ResponseWriter, r *http.Request) {
@@ -441,9 +499,14 @@ func handlePackages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rawJSON, gzData, modTime, err := loadDataWithCache()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to load package data: %v", err), http.StatusInternalServerError)
+	cacheMu.RLock()
+	rawJSON := cachedRawJSON
+	gzData := cachedGzip
+	modTime := cachedModTime
+	cacheMu.RUnlock()
+
+	if rawJSON == nil {
+		http.Error(w, "Data background sync in progress", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -469,9 +532,6 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// Dynamic trigger to ensure fresh scan state before returning history
-	_, _, _, _ = loadDataWithCache()
 
 	hostname := r.URL.Query().Get("host")
 	pkgName := r.URL.Query().Get("pkg")
