@@ -11,8 +11,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -32,10 +34,19 @@ const (
 	PlaceholderVer  = "Filter version..."
 )
 
+type Vulnerability struct {
+	ID      string   `json:"id"`
+	CVE     []string `json:"cve,omitempty"`
+	Summary string   `json:"summary,omitempty"`
+	Details string   `json:"details,omitempty"`
+	URL     string   `json:"url,omitempty"`
+}
+
 type PackageInfo struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Arch    string `json:"arch"`
+	Name            string          `json:"name"`
+	Version         string          `json:"version"`
+	Arch            string          `json:"arch"`
+	Vulnerabilities []Vulnerability `json:"vulnerabilities,omitempty"`
 }
 
 type HostPayload struct {
@@ -45,17 +56,20 @@ type HostPayload struct {
 	OSVersion    string        `json:"os_version,omitempty"`
 	HostFunction string        `json:"host_function,omitempty"`
 	Packages     []PackageInfo `json:"packages"`
+	OSVEnabled   bool          `json:"osv_enabled"`
 }
 
 type FlatItem struct {
-	Hostname     string
-	IPAddress    string
-	OSName       string
-	OSVersion    string
-	HostFunction string
-	PkgName      string
-	Version      string
-	Arch         string
+	Hostname        string
+	IPAddress       string
+	OSName          string
+	OSVersion       string
+	HostFunction    string
+	PkgName         string
+	Version         string
+	Arch            string
+	Vulnerabilities []Vulnerability
+	OSVEnabled      bool
 }
 
 type DiffRow struct {
@@ -118,6 +132,12 @@ var (
 			Padding(0, 1).
 			Bold(true)
 
+	osvBadgeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#11111B")).
+			Background(cRed).
+			Padding(0, 1).
+			Bold(true)
+
 	syncBadge = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#11111B")).
 			Background(cYellow).
@@ -128,6 +148,11 @@ var (
 			Foreground(lipgloss.Color("#11111B")).
 			Background(cGreen).
 			Padding(0, 1).
+			Bold(true)
+
+	cveBadge = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(cRed).
 			Bold(true)
 
 	actionAddedBadge = lipgloss.NewStyle().
@@ -214,6 +239,7 @@ type dataMsg struct {
 	items     []FlatItem
 	timestamp time.Time
 	isDone    bool
+	hasOSV    bool
 }
 
 type historyDataMsg struct {
@@ -291,6 +317,24 @@ type model struct {
 	updateChan chan dataMsg
 	hasTLS     bool
 	hasPSK     bool
+	hasOSV     bool
+}
+
+func openURL(url string) error {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default:
+		cmd = "xdg-open"
+		args = []string{url}
+	}
+	return exec.Command(cmd, args...).Start()
 }
 
 func main() {
@@ -440,6 +484,8 @@ func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
 			}
 			defer func() { _ = resp.Body.Close() }()
 
+			osvHeaderActive := strings.EqualFold(resp.Header.Get("X-OSV-Enabled"), "true")
+
 			var reader io.Reader = resp.Body
 			if resp.Header.Get("Content-Encoding") == "gzip" {
 				gz, err := gzip.NewReader(resp.Body)
@@ -471,17 +517,21 @@ func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
 					break
 				}
 
+				isOSV := osvHeaderActive || host.OSVEnabled
+
 				var localItems []FlatItem
 				for _, pkg := range host.Packages {
 					localItems = append(localItems, FlatItem{
-						Hostname:     host.Hostname,
-						IPAddress:    host.IPAddress,
-						OSName:       host.OSName,
-						OSVersion:    host.OSVersion,
-						HostFunction: host.HostFunction,
-						PkgName:      pkg.Name,
-						Version:      pkg.Version,
-						Arch:         pkg.Arch,
+						Hostname:        host.Hostname,
+						IPAddress:       host.IPAddress,
+						OSName:          host.OSName,
+						OSVersion:       host.OSVersion,
+						HostFunction:    host.HostFunction,
+						PkgName:         pkg.Name,
+						Version:         pkg.Version,
+						Arch:            pkg.Arch,
+						Vulnerabilities: pkg.Vulnerabilities,
+						OSVEnabled:      isOSV,
 					})
 				}
 
@@ -489,6 +539,7 @@ func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
 					items:     localItems,
 					timestamp: serverMaxTime,
 					isDone:    false,
+					hasOSV:    isOSV,
 				}
 			}
 		}(s)
@@ -773,12 +824,13 @@ func saveCSV(items []FlatItem) string {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	if err := writer.Write([]string{"Hostname", "Package", "Version", "Architecture"}); err != nil {
+	if err := writer.Write([]string{"Hostname", "Package", "Version", "Architecture", "CVE_Count"}); err != nil {
 		return fmt.Sprintf("Error writing CSV header: %v", err)
 	}
 
 	for _, item := range items {
-		if err := writer.Write([]string{item.Hostname, item.PkgName, item.Version, item.Arch}); err != nil {
+		cveCount := fmt.Sprintf("%d", len(item.Vulnerabilities))
+		if err := writer.Write([]string{item.Hostname, item.PkgName, item.Version, item.Arch, cveCount}); err != nil {
 			return fmt.Sprintf("Error writing CSV row: %v", err)
 		}
 	}
@@ -924,6 +976,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case dataMsg:
+		if msg.hasOSV {
+			m.hasOSV = true
+		}
 		if msg.isDone {
 			m.loaded = true
 			m.sortData()
@@ -1040,6 +1095,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc", "ctrl+c":
 				m.showAboutModal = false
 				m.showHostModal = false
+				return m, nil
+
+			case "ctrl+o":
+				if m.showHostModal && len(m.selectedHost.Vulnerabilities) > 0 {
+					vuln := m.selectedHost.Vulnerabilities[0]
+					if vuln.URL != "" {
+						_ = openURL(vuln.URL)
+						m.flashMsg = fmt.Sprintf("Opened OSV details: %s", vuln.ID)
+					}
+				}
 				return m, nil
 
 			case "enter":
@@ -1225,13 +1290,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// 6. Main View Keyboard Navigation
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" {
+		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" && msg.String() != "ctrl+o" {
 			m.flashMsg = ""
 		}
 
 		switch msg.String() {
 		case "esc":
 			return m, tea.Quit
+		case "ctrl+o":
+			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
+				item := m.filtered[m.cursor]
+				if len(item.Vulnerabilities) > 0 && item.Vulnerabilities[0].URL != "" {
+					if err := openURL(item.Vulnerabilities[0].URL); err == nil {
+						m.flashMsg = fmt.Sprintf("Opened OSV URL for %s", item.PkgName)
+					} else {
+						m.flashMsg = fmt.Sprintf("Failed to open browser: %v", err)
+					}
+				} else if !item.OSVEnabled && !m.hasOSV {
+					m.flashMsg = "OSV integration disabled on daemon"
+				} else {
+					m.flashMsg = "No vulnerability URL available for package"
+				}
+			}
+			return m, nil
+
 		case "enter":
 			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				m.selectedHost = m.filtered[m.cursor]
@@ -1446,11 +1528,15 @@ func (m *model) getFleetInsights() string {
 	selectedPkg := m.filtered[m.cursor].PkgName
 	hostMap := make(map[string]bool)
 	versionMap := make(map[string]bool)
+	vulnCount := 0
 
 	for _, item := range m.filtered {
 		if strings.EqualFold(item.PkgName, selectedPkg) {
 			hostMap[item.Hostname] = true
 			versionMap[item.Version] = true
+			if len(item.Vulnerabilities) > vulnCount {
+				vulnCount = len(item.Vulnerabilities)
+			}
 		}
 	}
 
@@ -1460,8 +1546,13 @@ func (m *model) getFleetInsights() string {
 		filterTag = " (filtered search results)"
 	}
 
-	return fmt.Sprintf("📊 Fleet Insights%s: '%s' is present on %d host(s) across %d unique version(s)",
-		filterTag, selectedPkg, len(hostMap), len(versionMap))
+	vulnText := ""
+	if m.hasOSV && vulnCount > 0 {
+		vulnText = fmt.Sprintf(" ⚠️ %d Vulnerability/CVE(s) flagged", vulnCount)
+	}
+
+	return fmt.Sprintf("📊 Fleet Insights%s: '%s' is present on %d host(s) across %d unique version(s)%s",
+		filterTag, selectedPkg, len(hostMap), len(versionMap), vulnText)
 }
 
 func renderActionBadge(action string) string {
@@ -1725,12 +1816,32 @@ func (m model) View() string {
 
 		var bodyContent string
 		if m.hostModalTab == 0 {
-			bodyContent = lipgloss.JoinVertical(lipgloss.Left,
+			vulnSummary := "None detected"
+			if len(m.selectedHost.Vulnerabilities) > 0 {
+				var ids []string
+				for _, v := range m.selectedHost.Vulnerabilities {
+					if len(v.CVE) > 0 {
+						ids = append(ids, strings.Join(v.CVE, ", "))
+					} else {
+						ids = append(ids, v.ID)
+					}
+				}
+				vulnSummary = fmt.Sprintf("⚠️ %d flagged (%s)", len(m.selectedHost.Vulnerabilities), strings.Join(ids, ", "))
+			}
+
+			overviewLines := []string{
 				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Hostname:      "), rowStyleNormal.Render(m.selectedHost.Hostname)),
 				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("IP Address:    "), rowStyleNormal.Render(ipStr)),
 				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("OS:            "), rowStyleNormal.Render(osStr)),
 				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Host Function: "), rowStyleNormal.Render(fnStr)),
-			)
+				lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Package:       "), rowStyleNormal.Render(m.selectedHost.PkgName+" "+m.selectedHost.Version)),
+			}
+
+			if m.selectedHost.OSVEnabled || m.hasOSV {
+				overviewLines = append(overviewLines, lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Security/CVE:  "), lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(vulnSummary)))
+			}
+
+			bodyContent = strings.Join(overviewLines, "\n")
 		} else {
 			if len(m.hostHistoryEvents) == 0 {
 				bodyContent = lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render("No package changes recorded for this host.")
@@ -1741,7 +1852,6 @@ func (m model) View() string {
 					end = len(m.hostHistoryEvents)
 				}
 
-				// Strict Column widths for Host Modal History (col2W removed to fix compiler error)
 				col1W := 14 // Date
 				col3W := 26 // Package Name
 				col4W := 32 // Version Details
@@ -1779,6 +1889,11 @@ func (m model) View() string {
 			}
 		}
 
+		helpBar := "[Tab] Switch Tab  |  [Enter] Inspect Full Timeline  |  [Esc] Close"
+		if len(m.selectedHost.Vulnerabilities) > 0 {
+			helpBar = "[Ctrl+O] Open OSV Details  |  " + helpBar
+		}
+
 		modalContent := lipgloss.JoinVertical(lipgloss.Center,
 			titleBadge.Render(hostTitle),
 			"",
@@ -1786,7 +1901,7 @@ func (m model) View() string {
 			"",
 			bodyContent,
 			"",
-			lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Tab  |  [Enter] Inspect Full Package Timeline  |  [Esc] Close"),
+			lipgloss.NewStyle().Foreground(cMuted).Render(helpBar),
 		)
 		dialog := modalStyle.Render(modalContent)
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
@@ -1817,7 +1932,7 @@ func (m model) View() string {
 			for _, h := range matches {
 				pills = append(pills, lipgloss.NewStyle().Foreground(cCyan).Bold(true).Render(h))
 			}
-			return lipgloss.NewStyle().Foreground(cMuted).Render("   💡 Suggestions: ") + strings.Join(pills, lipgloss.NewStyle().Foreground(cMuted).Render("  •  "))
+			return lipgloss.NewStyle().Foreground(cMuted).Render("   💡 Suggestions: ") + strings.Join(pills, lipgloss.NewStyle().Foreground(cMuted).Render("   •   "))
 		}
 
 		matchesA := m.getMatchedHosts(m.diffHostAInput.Value(), "")
@@ -2008,6 +2123,11 @@ func (m model) View() string {
 	}
 	sBadge := secBadge.Render(secStatus)
 
+	var osvBadgeStr string
+	if m.hasOSV {
+		osvBadgeStr = " " + osvBadgeStyle.Render("🛡️ OSV")
+	}
+
 	var stBadge string
 	if !m.loaded {
 		stBadge = syncBadge.Render(" ⚡ STREAMING ")
@@ -2021,7 +2141,7 @@ func (m model) View() string {
 	}
 	mText := metaStyle.Render(fmt.Sprintf("Updated: %s", timeStr))
 
-	leftBadges := lipgloss.JoinHorizontal(lipgloss.Center, tBadge, " ", sBadge, " ", stBadge)
+	leftBadges := lipgloss.JoinHorizontal(lipgloss.Center, tBadge, " ", sBadge, osvBadgeStr, " ", stBadge)
 	rightMeta := mText
 	if m.flashMsg != "" {
 		rightMeta = flashStyle.Render(m.flashMsg) + " " + mText
@@ -2146,6 +2266,10 @@ func (m model) View() string {
 		}
 
 		rPkgRaw := " " + item.PkgName
+		if m.hasOSV && len(item.Vulnerabilities) > 0 {
+			rPkgRaw += " ⚠️"
+		}
+
 		rVerRaw := " " + item.Version
 
 		var rHost, rPkg, rVer string
@@ -2155,7 +2279,11 @@ func (m model) View() string {
 			rVer = selectedStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
 		} else {
 			rHost = rowStyleNormal.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
-			rPkg = rowStyleNormal.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+			if m.hasOSV && len(item.Vulnerabilities) > 0 {
+				rPkg = lipgloss.NewStyle().Foreground(cRed).Bold(true).Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+			} else {
+				rPkg = rowStyleNormal.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
+			}
 			rVer = rowStyleNormal.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
 		}
 
@@ -2181,9 +2309,12 @@ func (m model) View() string {
 	}
 
 	keyHelp := "[Enter] Info  |  [Ctrl+Y] History  |  [Ctrl+D] Diff  |  [Ctrl+S] CSV  |  [Tab] Switch"
+	if m.hasOSV {
+		keyHelp = "[Ctrl+O] Open OSV Link  |  " + keyHelp
+	}
 	counterText := fmt.Sprintf("Records: %d-%d / %d (Total: %d)", displayStart, end, len(m.filtered), len(m.allItems))
 
-	footerText := fmt.Sprintf("%s  •  %s", keyHelp, counterText)
+	footerText := fmt.Sprintf("%s   •   %s", keyHelp, counterText)
 	footerContent := truncate(footerText, innerWidth)
 
 	footerBox := footerBoxStyle.Width(innerWidth + 2).Render(footerContent)
