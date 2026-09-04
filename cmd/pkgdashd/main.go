@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -57,8 +58,9 @@ var (
 )
 
 type pkgKey struct {
-	Name    string
-	Version string
+	Name      string
+	Version   string
+	Ecosystem string
 }
 
 type osvCacheEntry struct {
@@ -105,7 +107,8 @@ type osvQuery struct {
 }
 
 type osvPackage struct {
-	Name string `json:"name"`
+	Name      string `json:"name"`
+	Ecosystem string `json:"ecosystem,omitempty"`
 }
 
 type osvBatchRequest struct {
@@ -181,10 +184,8 @@ func main() {
 
 	historyMgr = NewHistoryManager(activeDataPath)
 
-	// Perform initial fast scan (without waiting for OSV network requests)
 	refreshCache(false)
 
-	// Start background synchronization routine
 	go startBackgroundSync(syncInterval)
 
 	http.HandleFunc("/packages", handlePackages)
@@ -205,6 +206,36 @@ func main() {
 			log.Fatalf("Server error: %v", err)
 		}
 	}
+}
+
+func determineEcosystem(osName, osVersion string) string {
+	name := strings.ToLower(osName)
+
+	if strings.Contains(name, "ubuntu") {
+		re := regexp.MustCompile(`\d+\.\d+`)
+		if match := re.FindString(osVersion); match != "" {
+			return "Ubuntu:" + match
+		}
+		return "Ubuntu"
+	}
+
+	if strings.Contains(name, "debian") {
+		parts := strings.Split(osVersion, ".")
+		if len(parts) > 0 && parts[0] != "" {
+			return "Debian:" + parts[0]
+		}
+		return "Debian"
+	}
+
+	if strings.Contains(name, "alpine") {
+		re := regexp.MustCompile(`\d+\.\d+`)
+		if match := re.FindString(osVersion); match != "" {
+			return "Alpine:v" + match
+		}
+		return "Alpine"
+	}
+
+	return ""
 }
 
 func initOSVHTTPClient() {
@@ -254,7 +285,6 @@ func saveOSVCacheToDisk() {
 }
 
 func startBackgroundSync(interval time.Duration) {
-	// First OSV background scan shortly after startup
 	time.Sleep(2 * time.Second)
 	if activeOSVEnabled {
 		refreshCache(true)
@@ -310,7 +340,6 @@ func refreshCache(fetchOSV bool) {
 	}
 	previousState = currentState
 
-	// Fetch OSV vulnerabilities asynchronously
 	if activeOSVEnabled && len(allHosts) > 0 {
 		if fetchOSV && !isScanning {
 			go func(h []HostPayload) {
@@ -321,7 +350,6 @@ func refreshCache(fetchOSV bool) {
 				updatePayloadCache(h, newestTime)
 			}(allHosts)
 		} else {
-			// Attach existing cached OSV data without blocking
 			attachCachedOSV(allHosts)
 		}
 	}
@@ -357,9 +385,10 @@ func attachCachedOSV(hosts []HostPayload) {
 	defer osvCacheMu.RUnlock()
 
 	for i := range hosts {
+		eco := determineEcosystem(hosts[i].OSName, hosts[i].OSVersion)
 		for j := range hosts[i].Packages {
 			p := &hosts[i].Packages[j]
-			key := p.Name + "@" + p.Version
+			key := p.Name + "@" + p.Version + "@" + eco
 			if entry, ok := osvCache[key]; ok && len(entry.Vulnerabilities) > 0 {
 				p.Vulnerabilities = entry.Vulnerabilities
 			}
@@ -370,9 +399,10 @@ func attachCachedOSV(hosts []HostPayload) {
 func enrichWithOSV(hosts []HostPayload) {
 	uniquePkgs := make(map[pkgKey]bool)
 	for _, h := range hosts {
+		eco := determineEcosystem(h.OSName, h.OSVersion)
 		for _, p := range h.Packages {
 			if p.Name != "" && p.Version != "" {
-				uniquePkgs[pkgKey{Name: p.Name, Version: p.Version}] = true
+				uniquePkgs[pkgKey{Name: p.Name, Version: p.Version, Ecosystem: eco}] = true
 			}
 		}
 	}
@@ -380,7 +410,7 @@ func enrichWithOSV(hosts []HostPayload) {
 	var toFetch []pkgKey
 	osvCacheMu.RLock()
 	for pk := range uniquePkgs {
-		key := pk.Name + "@" + pk.Version
+		key := pk.Name + "@" + pk.Version + "@" + pk.Ecosystem
 		entry, exists := osvCache[key]
 		if !exists || time.Since(entry.FetchedAt) > osvCacheTTL {
 			toFetch = append(toFetch, pk)
@@ -389,7 +419,7 @@ func enrichWithOSV(hosts []HostPayload) {
 	osvCacheMu.RUnlock()
 
 	if len(toFetch) > 0 {
-		log.Printf("Querying OSV.dev API for %d packages...", len(toFetch))
+		log.Printf("Querying OSV.dev API for %d packages (with Ecosystem mapping)...", len(toFetch))
 		fetchOSVBatch(toFetch)
 	}
 
@@ -408,7 +438,10 @@ func fetchOSVBatch(pkgs []pkgKey) {
 		reqBody := osvBatchRequest{Queries: make([]osvQuery, len(chunk))}
 		for idx, p := range chunk {
 			reqBody.Queries[idx] = osvQuery{
-				Package: osvPackage{Name: p.Name},
+				Package: osvPackage{
+					Name:      p.Name,
+					Ecosystem: p.Ecosystem,
+				},
 				Version: p.Version,
 			}
 		}
@@ -446,7 +479,7 @@ func fetchOSVBatch(pkgs []pkgKey) {
 				break
 			}
 			p := chunk[idx]
-			key := p.Name + "@" + p.Version
+			key := p.Name + "@" + p.Version + "@" + p.Ecosystem
 
 			var vulns []Vulnerability
 			for _, v := range res.Vulns {
@@ -457,10 +490,7 @@ func fetchOSVBatch(pkgs []pkgKey) {
 					}
 				}
 
-				// Singular URL structure required by OSV.dev
 				vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", v.ID)
-
-				// Prefer vendor advisory / web link if available in references
 				for _, ref := range v.References {
 					if (ref.Type == "ADVISORY" || ref.Type == "WEB") && strings.HasPrefix(ref.URL, "http") {
 						vulnURL = ref.URL

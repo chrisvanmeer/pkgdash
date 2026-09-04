@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,96 +24,84 @@ type ChangeEvent struct {
 type HistoryManager struct {
 	mu       sync.RWMutex
 	filePath string
-	events   []ChangeEvent
 }
 
 func NewHistoryManager(dataPath string) *HistoryManager {
-	hm := &HistoryManager{
+	return &HistoryManager{
 		filePath: filepath.Join(dataPath, "history.jsonl"),
-		events:   make([]ChangeEvent, 0),
-	}
-	hm.loadEvents()
-	return hm
-}
-
-func (hm *HistoryManager) loadEvents() {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	f, err := os.Open(hm.filePath)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		var evt ChangeEvent
-		if err := json.Unmarshal(scanner.Bytes(), &evt); err == nil {
-			hm.events = append(hm.events, evt)
-		}
 	}
 }
 
 func (hm *HistoryManager) RecordChanges(events []ChangeEvent) {
-	if len(events) == 0 {
-		return
-	}
-
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
 	f, err := os.OpenFile(hm.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 	if err != nil {
+		log.Printf("Failed to open history file: %v", err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
-	writer := bufio.NewWriter(f)
 	for _, evt := range events {
-		hm.events = append(hm.events, evt)
-		if data, err := json.Marshal(evt); err == nil {
-			_, _ = writer.Write(data)
-			_, _ = writer.WriteString("\n")
+		data, err := json.Marshal(evt)
+		if err != nil {
+			continue
 		}
+		_, _ = f.Write(append(data, '\n'))
 	}
-	_ = writer.Flush()
 }
 
 func (hm *HistoryManager) GetHistory(hostname, pkgName string, limit int) []ChangeEvent {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 
-	result := make([]ChangeEvent, 0)
-	for i := len(hm.events) - 1; i >= 0; i-- {
-		evt := hm.events[i]
-		if hostname != "" && !strings.EqualFold(evt.Hostname, hostname) {
+	f, err := os.Open(hm.filePath)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+
+	var events []ChangeEvent
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
-		if pkgName != "" && !strings.EqualFold(evt.Package, pkgName) {
-			continue
-		}
-		result = append(result, evt)
-		if limit > 0 && len(result) >= limit {
-			break
+		var evt ChangeEvent
+		if err := json.Unmarshal([]byte(line), &evt); err == nil {
+			if hostname != "" && !strings.EqualFold(evt.Hostname, hostname) {
+				continue
+			}
+			if pkgName != "" && !strings.EqualFold(evt.Package, pkgName) {
+				continue
+			}
+			events = append(events, evt)
 		}
 	}
-	return result
+	_ = scanner.Err()
+
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].Timestamp.After(events[j].Timestamp)
+	})
+
+	if limit > 0 && len(events) > limit {
+		return events[:limit]
+	}
+	return events
 }
 
-func ComputeDiffs(oldState, newState map[string]map[string]string) []ChangeEvent {
-	var events []ChangeEvent
+func ComputeDiffs(prev, curr map[string]map[string]string) []ChangeEvent {
+	var diffs []ChangeEvent
 	now := time.Now().UTC()
 
-	if len(oldState) == 0 {
-		return events
-	}
-
-	for host, newPkgs := range newState {
-		oldPkgs, hostExisted := oldState[host]
+	// Check for added or modified
+	for host, currPkgs := range curr {
+		prevPkgs, hostExisted := prev[host]
 		if !hostExisted {
-			for pkg, ver := range newPkgs {
-				events = append(events, ChangeEvent{
+			for pkg, ver := range currPkgs {
+				diffs = append(diffs, ChangeEvent{
 					Timestamp:  now,
 					Hostname:   host,
 					Package:    pkg,
@@ -122,40 +112,47 @@ func ComputeDiffs(oldState, newState map[string]map[string]string) []ChangeEvent
 			continue
 		}
 
-		for pkg, newVer := range newPkgs {
-			oldVer, pkgExisted := oldPkgs[pkg]
+		for pkg, currVer := range currPkgs {
+			prevVer, pkgExisted := prevPkgs[pkg]
 			if !pkgExisted {
-				events = append(events, ChangeEvent{
+				diffs = append(diffs, ChangeEvent{
 					Timestamp:  now,
 					Hostname:   host,
 					Package:    pkg,
-					NewVersion: newVer,
+					NewVersion: currVer,
 					Action:     "ADDED",
 				})
-			} else if oldVer != newVer {
-				events = append(events, ChangeEvent{
+			} else if prevVer != currVer {
+				diffs = append(diffs, ChangeEvent{
 					Timestamp:  now,
 					Hostname:   host,
 					Package:    pkg,
-					OldVersion: oldVer,
-					NewVersion: newVer,
+					OldVersion: prevVer,
+					NewVersion: currVer,
 					Action:     "MODIFIED",
 				})
 			}
 		}
+	}
 
-		for pkg, oldVer := range oldPkgs {
-			if _, exists := newPkgs[pkg]; !exists {
-				events = append(events, ChangeEvent{
+	// Check for removed
+	for host, prevPkgs := range prev {
+		currPkgs, hostStillExists := curr[host]
+		if !hostStillExists {
+			continue
+		}
+		for pkg, prevVer := range prevPkgs {
+			if _, pkgStillExists := currPkgs[pkg]; !pkgStillExists {
+				diffs = append(diffs, ChangeEvent{
 					Timestamp:  now,
 					Hostname:   host,
 					Package:    pkg,
-					OldVersion: oldVer,
+					OldVersion: prevVer,
 					Action:     "REMOVED",
 				})
 			}
 		}
 	}
 
-	return events
+	return diffs
 }
