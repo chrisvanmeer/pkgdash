@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -77,14 +78,17 @@ func (hm *HistoryManager) RecordChanges(events []ChangeEvent) {
 	_ = writer.Flush()
 }
 
-func (hm *HistoryManager) GetHistory(hostname string, limit int) []ChangeEvent {
+func (hm *HistoryManager) GetHistory(hostname, pkgName string, limit int) []ChangeEvent {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 
 	result := make([]ChangeEvent, 0)
 	for i := len(hm.events) - 1; i >= 0; i-- {
 		evt := hm.events[i]
-		if hostname != "" && evt.Hostname != hostname {
+		if hostname != "" && !strings.EqualFold(evt.Hostname, hostname) {
+			continue
+		}
+		if pkgName != "" && !strings.EqualFold(evt.Package, pkgName) {
 			continue
 		}
 		result = append(result, evt)
@@ -95,13 +99,12 @@ func (hm *HistoryManager) GetHistory(hostname string, limit int) []ChangeEvent {
 	return result
 }
 
-// ComputeDiffs vergelijkt de oude in-memory staat met de nieuwe scan
 func ComputeDiffs(oldState, newState map[string]map[string]string) []ChangeEvent {
 	var events []ChangeEvent
 	now := time.Now().UTC()
 
 	if len(oldState) == 0 {
-		return events // Sla eerste opstart over om een gigantische initiële dump te voorkomen
+		return events
 	}
 
 	for host, newPkgs := range newState {

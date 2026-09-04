@@ -217,8 +217,9 @@ type dataMsg struct {
 }
 
 type historyDataMsg struct {
-	events []ChangeEvent
-	isHost bool
+	events    []ChangeEvent
+	queryHost string
+	queryPkg  string
 }
 
 type model struct {
@@ -248,9 +249,13 @@ type model struct {
 	selectedHost   FlatItem
 	hostModalTab   int // 0: Overview, 1: History
 
-	// New: Event Detail Modal
-	showEventDetailModal bool
-	selectedEvent        ChangeEvent
+	// Per-Package Chronological Timeline Modal
+	showPackageHistoryModal bool
+	packageHistoryEvents    []ChangeEvent
+	packageHistoryCursor    int
+	packageHistoryOffset    int
+	selectedPkgHost         string
+	selectedPkgName         string
 
 	// Fleet History (Time Travel)
 	showHistoryView bool
@@ -495,7 +500,7 @@ func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
 	}()
 }
 
-func fetchHistoryCmd(servers []string, psk string, hostname string) tea.Cmd {
+func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string) tea.Cmd {
 	return func() tea.Msg {
 		var allEvents []ChangeEvent
 		customTransport := &http.Transport{
@@ -517,8 +522,16 @@ func fetchHistoryCmd(servers []string, psk string, hostname string) tea.Cmd {
 				url += ":9876"
 			}
 			url += "/history"
+
+			var params []string
 			if hostname != "" {
-				url += "?host=" + hostname
+				params = append(params, "host="+hostname)
+			}
+			if pkgName != "" {
+				params = append(params, "pkg="+pkgName)
+			}
+			if len(params) > 0 {
+				url += "?" + strings.Join(params, "&")
 			}
 
 			req, err := http.NewRequest("GET", url, nil)
@@ -542,8 +555,9 @@ func fetchHistoryCmd(servers []string, psk string, hostname string) tea.Cmd {
 		}
 
 		return historyDataMsg{
-			events: allEvents,
-			isHost: hostname != "",
+			events:    allEvents,
+			queryHost: hostname,
+			queryPkg:  pkgName,
 		}
 	}
 }
@@ -665,8 +679,28 @@ func (m *model) updateHostHistoryViewport() {
 
 	if m.hostHistoryCursor < m.hostHistoryOffset {
 		m.hostHistoryOffset = m.hostHistoryCursor
-	} else if m.hostHistoryCursor >= m.hostHistoryOffset+6 { // Increased to 6 to show more rows
+	} else if m.hostHistoryCursor >= m.hostHistoryOffset+6 {
 		m.hostHistoryOffset = m.hostHistoryCursor - 6 + 1
+	}
+}
+
+func (m *model) updatePackageHistoryViewport() {
+	if len(m.packageHistoryEvents) == 0 {
+		m.packageHistoryCursor = 0
+		m.packageHistoryOffset = 0
+		return
+	}
+
+	if m.packageHistoryCursor < 0 {
+		m.packageHistoryCursor = 0
+	} else if m.packageHistoryCursor >= len(m.packageHistoryEvents) {
+		m.packageHistoryCursor = len(m.packageHistoryEvents) - 1
+	}
+
+	if m.packageHistoryCursor < m.packageHistoryOffset {
+		m.packageHistoryOffset = m.packageHistoryCursor
+	} else if m.packageHistoryCursor >= m.packageHistoryOffset+8 {
+		m.packageHistoryOffset = m.packageHistoryCursor - 8 + 1
 	}
 }
 
@@ -908,7 +942,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForUpdate(m.updateChan)
 
 	case historyDataMsg:
-		if msg.isHost {
+		if msg.queryPkg != "" {
+			m.packageHistoryEvents = msg.events
+			m.selectedPkgHost = msg.queryHost
+			m.selectedPkgName = msg.queryPkg
+			m.packageHistoryCursor = 0
+			m.packageHistoryOffset = 0
+			m.showPackageHistoryModal = true
+		} else if msg.queryHost != "" {
 			m.hostHistoryEvents = msg.events
 			m.hostHistoryCursor = 0
 			m.hostHistoryOffset = 0
@@ -920,13 +961,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 1. Event Detail Popup Modal (Appears over History or Host modals)
-	if m.showEventDetailModal {
+	// 1. Per-Package Chronological History Modal
+	if m.showPackageHistoryModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.String() {
 			case "esc", "enter", "ctrl+c":
-				m.showEventDetailModal = false
+				m.showPackageHistoryModal = false
+				return m, nil
+
+			case "up", "ctrl+k":
+				m.packageHistoryCursor--
+				m.updatePackageHistoryViewport()
+				return m, nil
+
+			case "down", "ctrl+j":
+				m.packageHistoryCursor++
+				m.updatePackageHistoryViewport()
 				return m, nil
 			}
 		case tea.WindowSizeMsg:
@@ -936,7 +987,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 2. Fleet History (Time Travel) View
+	// 2. Fleet History (Time Travel) View (Ctrl+Y)
 	if m.showHistoryView {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -946,10 +997,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "enter":
-				// Open details modal for the selected event
 				if len(m.historyEvents) > 0 && m.historyCursor < len(m.historyEvents) {
-					m.selectedEvent = m.historyEvents[m.historyCursor]
-					m.showEventDetailModal = true
+					evt := m.historyEvents[m.historyCursor]
+					return m, fetchHistoryCmd(m.servers, m.psk, evt.Hostname, evt.Package)
 				}
 				return m, nil
 
@@ -996,10 +1046,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.showAboutModal {
 					m.showAboutModal = false
 				} else if m.showHostModal && m.hostModalTab == 1 {
-					// Open detail for the selected host history event
 					if len(m.hostHistoryEvents) > 0 && m.hostHistoryCursor < len(m.hostHistoryEvents) {
-						m.selectedEvent = m.hostHistoryEvents[m.hostHistoryCursor]
-						m.showEventDetailModal = true
+						evt := m.hostHistoryEvents[m.hostHistoryCursor]
+						return m, fetchHistoryCmd(m.servers, m.psk, evt.Hostname, evt.Package)
 					}
 				} else {
 					m.showHostModal = false
@@ -1010,7 +1059,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.showHostModal {
 					m.hostModalTab = (m.hostModalTab + 1) % 2
 					if m.hostModalTab == 1 && len(m.hostHistoryEvents) == 0 {
-						return m, fetchHistoryCmd(m.servers, m.psk, m.selectedHost.Hostname)
+						return m, fetchHistoryCmd(m.servers, m.psk, m.selectedHost.Hostname, "")
 					}
 				}
 				return m, nil
@@ -1196,7 +1245,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+y":
 			m.showHistoryView = true
-			return m, fetchHistoryCmd(m.servers, m.psk, "")
+			return m, fetchHistoryCmd(m.servers, m.psk, "", "")
 		case "ctrl+s":
 			m.flashMsg = saveCSV(m.filtered)
 			return m, nil
@@ -1447,28 +1496,86 @@ func (m model) View() string {
 		return "Initializing Dashboard..."
 	}
 
-	// 1. Event Detail Popup Modal (Appears over History or Host modals)
-	if m.showEventDetailModal {
-		evt := m.selectedEvent
-		evtTitle := fmt.Sprintf(" PACKAGE AUDIT EVENT: %s ", evt.Package)
+	// 1. Per-Package Chronological Timeline Modal
+	if m.showPackageHistoryModal {
+		innerWidth := m.width - 12
+		if innerWidth < 70 {
+			innerWidth = 70
+		}
 
-		details := lipgloss.JoinVertical(lipgloss.Left,
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Timestamp:   "), rowStyleNormal.Render(evt.Timestamp.Local().Format("2006-01-02 15:04:05"))),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Server:      "), rowStyleNormal.Render(evt.Hostname)),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Action:      "), renderActionBadge(evt.Action)),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Package:     "), rowStyleNormal.Render(evt.Package)),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Old Version: "), rowStyleNormal.Render(evt.OldVersion)),
-			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("New Version: "), rowStyleNormal.Render(evt.NewVersion)),
+		titleBar := titleBadge.Render(fmt.Sprintf(" 📦 PACKAGE TIMELINE: %s on %s ", m.selectedPkgName, m.selectedPkgHost))
+
+		colTimeW := 18
+		colActionW := 13
+		colVerW := innerWidth - colTimeW - colActionW
+
+		hdrTime := tableHeaderStyle.Width(colTimeW).MaxWidth(colTimeW).Render(" TIMESTAMP")
+		hdrAction := tableHeaderStyle.Width(colActionW).MaxWidth(colActionW).Render(" ACTION")
+		hdrVer := tableHeaderStyle.Width(colVerW).MaxWidth(colVerW).Render(" VERSION CHANGE")
+
+		tableHdr := lipgloss.JoinHorizontal(lipgloss.Left, hdrTime, hdrAction, hdrVer)
+
+		start := m.packageHistoryOffset
+		end := m.packageHistoryOffset + 8
+		if end > len(m.packageHistoryEvents) {
+			end = len(m.packageHistoryEvents)
+		}
+
+		var rowStrs []string
+		if len(m.packageHistoryEvents) == 0 {
+			rowStrs = append(rowStrs, lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render(" No changes recorded for this package."))
+		} else {
+			viewport := m.packageHistoryEvents[start:end]
+			for i, evt := range viewport {
+				absIndex := start + i
+				isSelected := absIndex == m.packageHistoryCursor
+
+				timeStr := " " + evt.Timestamp.Local().Format("2006-01-02 15:04:05")
+				badgeStr := renderActionBadge(evt.Action)
+
+				var verDetail string
+				if evt.Action == "MODIFIED" {
+					verDetail = fmt.Sprintf(" %s -> %s", evt.OldVersion, evt.NewVersion)
+				} else if evt.Action == "ADDED" {
+					verDetail = " " + evt.NewVersion
+				} else {
+					verDetail = " " + evt.OldVersion
+				}
+
+				if isSelected {
+					cTime := selectedStyle.Width(colTimeW).MaxWidth(colTimeW).Render(truncate(timeStr, colTimeW))
+					cBadge := badgeStr
+					cVer := selectedStyle.Width(colVerW).MaxWidth(colVerW).Render(truncate(verDetail, colVerW))
+
+					rowStrs = append(rowStrs, lipgloss.JoinHorizontal(lipgloss.Left, cTime, cBadge, cVer))
+				} else {
+					cTime := rowStyleNormal.Width(colTimeW).MaxWidth(colTimeW).Render(truncate(timeStr, colTimeW))
+					cBadge := badgeStr
+					cVer := lipgloss.NewStyle().Foreground(cMuted).Width(colVerW).MaxWidth(colVerW).Render(truncate(verDetail, colVerW))
+
+					rowStrs = append(rowStrs, lipgloss.JoinHorizontal(lipgloss.Left, cTime, cBadge, cVer))
+				}
+			}
+		}
+
+		for i := len(rowStrs); i < 8; i++ {
+			rowStrs = append(rowStrs, "")
+		}
+
+		historyBody := lipgloss.JoinVertical(lipgloss.Left, tableHdr, strings.Join(rowStrs, "\n"))
+		frame := panelStyle.BorderForeground(cPurple).Width(innerWidth + 4).Render(historyBody)
+
+		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Esc / Enter] Back to Previous View")
+
+		content := lipgloss.JoinVertical(lipgloss.Center,
+			titleBar,
+			"",
+			frame,
+			"",
+			helpText,
 		)
 
-		modalContent := lipgloss.JoinVertical(lipgloss.Center,
-			titleBadge.Render(evtTitle),
-			"",
-			details,
-			"",
-			lipgloss.NewStyle().Foreground(cMuted).Render("[Press Esc or Enter to close]"),
-		)
-		dialog := modalStyle.Render(modalContent)
+		dialog := modalStyle.Render(content)
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
@@ -1488,7 +1595,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 3. Fleet History View (Ctrl+Y) - Expanded columns and proper alignment
+	// 3. Fleet History View (Ctrl+Y)
 	if m.showHistoryView {
 		innerWidth := m.width - 10
 		if innerWidth < 90 {
@@ -1571,7 +1678,7 @@ func (m model) View() string {
 		historyBody := lipgloss.JoinVertical(lipgloss.Left, tableHdr, strings.Join(rowStrs, "\n"))
 		frame := panelStyle.BorderForeground(cPurple).Width(innerWidth + 4).Render(historyBody)
 
-		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Enter] Inspect Event Details  |  [Esc / Ctrl+Y] Close History View")
+		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Enter] Inspect Full Package Timeline  |  [Esc / Ctrl+Y] Close History View")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -1634,10 +1741,10 @@ func (m model) View() string {
 					end = len(m.hostHistoryEvents)
 				}
 
-				// Strict Column widths for Host Modal History
+				// Strict Column widths for Host Modal History (col2W removed to fix compiler error)
 				col1W := 14 // Date
-				col3W := 24 // Package Name
-				col4W := 30 // Version Details
+				col3W := 26 // Package Name
+				col4W := 32 // Version Details
 
 				var rows []string
 				viewport := m.hostHistoryEvents[start:end]
@@ -1679,7 +1786,7 @@ func (m model) View() string {
 			"",
 			bodyContent,
 			"",
-			lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Tab  |  [Enter] Inspect Event Details  |  [Esc] Close"),
+			lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Tab  |  [Enter] Inspect Full Package Timeline  |  [Esc] Close"),
 		)
 		dialog := modalStyle.Render(modalContent)
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)

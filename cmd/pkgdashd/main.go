@@ -233,7 +233,8 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 	_, _, _, _ = loadDataWithCache()
 
 	hostname := r.URL.Query().Get("host")
-	events := historyMgr.GetHistory(hostname, 100)
+	pkgName := r.URL.Query().Get("pkg")
+	events := historyMgr.GetHistory(hostname, pkgName, 100)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(events)

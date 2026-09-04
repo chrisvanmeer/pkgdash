@@ -92,7 +92,7 @@ func main() {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/table", handleTable)
 	http.HandleFunc("/modal/host", handleHostModal)
-	http.HandleFunc("/modal/host/history", handleHostHistoryModal)
+	http.HandleFunc("/modal/package/history", handlePackageHistoryModal)
 	http.HandleFunc("/modal/diff", handleDiffModal)
 	http.HandleFunc("/modal/timeline", handleTimelineModal)
 	http.HandleFunc("/diff/results", handleDiffResults)
@@ -243,14 +243,13 @@ func fetchAllData(servers []string, psk string) {
 	}
 }
 
-func fetchHistoryFromDaemons(hostname string) []ChangeEvent {
+func fetchHistoryFromDaemons(hostname, pkgName string) []ChangeEvent {
 	var allEvents []ChangeEvent
 	customTransport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	client := http.Client{Timeout: 10 * time.Second, Transport: customTransport}
 
 	dataMutex.RLock()
-	servers := serversConfig
-	psk := pskConfig
+	servers, psk := serversConfig, pskConfig
 	dataMutex.RUnlock()
 
 	for _, s := range servers {
@@ -263,8 +262,16 @@ func fetchHistoryFromDaemons(hostname string) []ChangeEvent {
 			url += ":9876"
 		}
 		url += "/history"
+
+		var params []string
 		if hostname != "" {
-			url += "?host=" + hostname
+			params = append(params, "host="+hostname)
+		}
+		if pkgName != "" {
+			params = append(params, "pkg="+pkgName)
+		}
+		if len(params) > 0 {
+			url += "?" + strings.Join(params, "&")
 		}
 
 		req, err := http.NewRequest("GET", url, nil)
@@ -290,7 +297,6 @@ func fetchHistoryFromDaemons(hostname string) []ChangeEvent {
 	sort.Slice(allEvents, func(i, j int) bool {
 		return allEvents[i].Timestamp.After(allEvents[j].Timestamp)
 	})
-
 	return allEvents
 }
 
@@ -450,17 +456,20 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 	_ = tmpl.ExecuteTemplate(w, "modal_host", host)
 }
 
-func handleHostHistoryModal(w http.ResponseWriter, r *http.Request) {
+func handlePackageHistoryModal(w http.ResponseWriter, r *http.Request) {
 	hostname := r.URL.Query().Get("h")
-	events := fetchHistoryFromDaemons(hostname)
-	_ = tmpl.ExecuteTemplate(w, "modal_host_history", map[string]interface{}{
+	pkgName := r.URL.Query().Get("p")
+
+	events := fetchHistoryFromDaemons(hostname, pkgName)
+	_ = tmpl.ExecuteTemplate(w, "modal_package_history", map[string]interface{}{
 		"Hostname": hostname,
+		"Package":  pkgName,
 		"Events":   events,
 	})
 }
 
 func handleTimelineModal(w http.ResponseWriter, r *http.Request) {
-	events := fetchHistoryFromDaemons("")
+	events := fetchHistoryFromDaemons("", "")
 	_ = tmpl.ExecuteTemplate(w, "modal_timeline", events)
 }
 
@@ -665,10 +674,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .panel { border: 2px solid var(--border); border-radius: 8px; padding: 0.5rem; }
         .header-panel { border-color: var(--purple); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
         .badge { padding: 0.1rem 0.5rem; font-weight: bold; color: var(--dark-text); display: inline-block; margin-right: 0.5rem; }
-        .bg-purple { background: var(--purple); } 
-        .bg-cyan { background: var(--cyan); } 
-        .bg-green { background: var(--green); } 
-        .bg-yellow { background: var(--yellow); } 
+        .bg-purple { background: var(--purple); }
+        .bg-cyan { background: var(--cyan); }
+        .bg-green { background: var(--green); }
+        .bg-yellow { background: var(--yellow); }
         .bg-red { background: var(--red); color: white; }
 
         .flex { display: flex; gap: 1rem; flex-shrink: 0; }
@@ -904,7 +913,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 
 {{define "modal_host"}}
     <div class="modal-header"><span class="badge bg-purple" style="text-transform: uppercase;"> HOST INFORMATION: {{.Hostname}} </span></div>
-    
+
     <div style="margin-bottom: 1.5rem; text-align: center;">
         <button class="tab-btn active" onclick="document.getElementById('tab-overview').style.display='block'; document.getElementById('tab-history').style.display='none'; this.classList.add('active'); this.nextElementSibling.classList.remove('active');">Overview</button>
         <button class="tab-btn" hx-get="/modal/host/history?h={{.Hostname}}" hx-target="#tab-history" onclick="document.getElementById('tab-overview').style.display='none'; document.getElementById('tab-history').style.display='block'; this.classList.add('active'); this.previousElementSibling.classList.remove('active');">Change History</button>
@@ -935,7 +944,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         </thead>
         <tbody>
             {{range .Events}}
-            <tr>
+            <tr hx-get="/modal/package/history?h={{$.Hostname}}&p={{.Package}}" hx-target="#host-dialog-content">
                 <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
                 <td>
                     {{if eq .Action "ADDED"}}<span class="badge bg-green">+ ADDED</span>{{end}}
@@ -959,7 +968,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 
 {{define "modal_timeline"}}
     <div class="modal-header"><span class="badge bg-purple"> 📜 FLEET AUDIT LOG / TIME TRAVEL </span></div>
-    
+
     <div style="max-height: 500px; overflow-y: auto;">
         {{if .}}
         <table class="history-table">
@@ -974,7 +983,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             </thead>
             <tbody>
                 {{range .}}
-                <tr>
+                <tr hx-get="/modal/package/history?h={{.Hostname}}&p={{.Package}}" hx-target="#timeline-dialog-content">
                     <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
                     <td class="text-cyan" style="font-weight:bold;">{{.Hostname}}</td>
                     <td>
@@ -995,6 +1004,39 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         {{else}}
         <div style="text-align:center; padding: 2rem; color:var(--muted); font-style:italic;">No package change events recorded yet across the fleet.</div>
         {{end}}
+    </div>
+{{end}}
+
+{{define "modal_package_history"}}
+    <div class="modal-header"><span class="badge bg-purple"> 📦 PACKAGE TIMELINE: {{.Package}} on {{.Hostname}} </span></div>
+
+    <div style="max-height: 400px; overflow-y: auto;">
+        <table class="history-table">
+            <thead>
+                <tr>
+                    <th style="width:200px;">TIMESTAMP</th>
+                    <th style="width:140px;">ACTION</th>
+                    <th>VERSION CHANGE</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .Events}}
+                <tr>
+                    <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
+                    <td>
+                        {{if eq .Action "ADDED"}}<span class="badge bg-green">+ ADDED</span>{{end}}
+                        {{if eq .Action "MODIFIED"}}<span class="badge bg-cyan">~ MODIFIED</span>{{end}}
+                        {{if eq .Action "REMOVED"}}<span class="badge bg-red">- REMOVED</span>{{end}}
+                    </td>
+                    <td style="font-family: monospace;">
+                        {{if eq .Action "ADDED"}}{{.NewVersion}}{{end}}
+                        {{if eq .Action "MODIFIED"}}{{.OldVersion}} &rarr; <span style="color:var(--green); font-weight:bold;">{{.NewVersion}}</span>{{end}}
+                        {{if eq .Action "REMOVED"}}{{.OldVersion}}{{end}}
+                    </td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
     </div>
 {{end}}
 
