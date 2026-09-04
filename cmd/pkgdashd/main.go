@@ -70,11 +70,10 @@ type osvCacheEntry struct {
 }
 
 var (
-	cacheMu        sync.RWMutex
-	cachedRawJSON  []byte
-	cachedGzip     []byte
-	cachedModTime  time.Time
-	lastCacheCheck time.Time
+	cacheMu       sync.RWMutex
+	cachedRawJSON []byte
+	cachedGzip    []byte
+	cachedModTime time.Time
 )
 
 type Vulnerability struct {
@@ -379,7 +378,6 @@ func updatePayloadCache(allHosts []HostPayload, newestTime time.Time) {
 	cachedRawJSON = rawJSON
 	cachedGzip = gzBuf.Bytes()
 	cachedModTime = newestTime
-	lastCacheCheck = time.Now()
 	cacheMu.Unlock()
 }
 
