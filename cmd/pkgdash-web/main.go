@@ -163,12 +163,18 @@ func fetchAllData(servers []string, psk string) {
 			url += "/packages"
 
 			req, err := http.NewRequest("GET", url, nil)
-			if err != nil { return }
+			if err != nil {
+				return
+			}
 			req.Header.Set("Accept-Encoding", "gzip")
-			if psk != "" { req.Header.Set("X-PSK", psk) }
+			if psk != "" {
+				req.Header.Set("X-PSK", psk)
+			}
 
 			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode != 200 { return }
+			if err != nil || resp.StatusCode != 200 {
+				return
+			}
 			defer func() { _ = resp.Body.Close() }()
 
 			var reader io.Reader = resp.Body
@@ -182,7 +188,9 @@ func fetchAllData(servers []string, psk string) {
 			if lastMod := resp.Header.Get("Last-Modified"); lastMod != "" {
 				if parsedTime, err := time.Parse(http.TimeFormat, lastMod); err == nil {
 					itemsMutex.Lock()
-					if parsedTime.After(latestTime) { latestTime = parsedTime }
+					if parsedTime.After(latestTime) {
+						latestTime = parsedTime
+					}
 					itemsMutex.Unlock()
 				}
 			}
@@ -223,8 +231,15 @@ func fetchAllData(servers []string, psk string) {
 // --- HTTP Handlers ---
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
+	isSecure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	secStatus := "🔓 HTTP"
+	if isSecure {
+		secStatus = "🔒 SECURE"
+	}
+
 	_ = tmpl.ExecuteTemplate(w, "index", map[string]interface{}{
 		"LastUpdated": lastUpdated.Local().Format("15:04:05"),
+		"SecStatus":   secStatus,
 	})
 }
 
@@ -273,11 +288,17 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int) {
 		}
 
 		if primaryEqual {
-			if ah != bh { return ah < bh }
-			if ap != bp { return ap < bp }
+			if ah != bh {
+				return ah < bh
+			}
+			if ap != bp {
+				return ap < bp
+			}
 			return av < bv
 		}
-		if sortDesc { return !primaryLess }
+		if sortDesc {
+			return !primaryLess
+		}
 		return primaryLess
 	})
 
@@ -322,7 +343,9 @@ func handleTable(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sortCol := r.URL.Query().Get("sort")
-	if sortCol == "" { sortCol = "host" }
+	if sortCol == "" {
+		sortCol = "host"
+	}
 	sortDesc := r.URL.Query().Get("desc") == "true"
 
 	dataMutex.RLock()
@@ -365,11 +388,15 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 func handleDiffModal(w http.ResponseWriter, r *http.Request) {
 	dataMutex.RLock()
 	hostMap := make(map[string]bool)
-	for _, item := range globalItems { hostMap[item.Hostname] = true }
+	for _, item := range globalItems {
+		hostMap[item.Hostname] = true
+	}
 	dataMutex.RUnlock()
 
 	var hosts []string
-	for h := range hostMap { hosts = append(hosts, h) }
+	for h := range hostMap {
+		hosts = append(hosts, h)
+	}
 	sort.Strings(hosts)
 
 	_ = tmpl.ExecuteTemplate(w, "modal_diff", map[string]interface{}{"Hosts": hosts})
@@ -407,19 +434,33 @@ func handleDiffResults(w http.ResponseWriter, r *http.Request) {
 	dataMutex.RUnlock()
 
 	var pNames []string
-	for p := range allPkgs { pNames = append(pNames, p) }
+	for p := range allPkgs {
+		pNames = append(pNames, p)
+	}
 	sort.Strings(pNames)
 
 	var rows []DiffRow
 	diffCount := 0
 	for _, name := range pNames {
-		vA, hasA := pkgsA[name]; if !hasA { vA = "-" }
-		vB, hasB := pkgsB[name]; if !hasB { vB = "-" }
+		vA, hasA := pkgsA[name]
+		if !hasA {
+			vA = "-"
+		}
+		vB, hasB := pkgsB[name]
+		if !hasB {
+			vB = "-"
+		}
 		isDiff := vA != vB
-		if isDiff { diffCount++ }
+		if isDiff {
+			diffCount++
+		}
 
-		if diffOnly && !isDiff { continue }
-		if filter != "" && !strings.Contains(strings.ToLower(name), filter) && !strings.Contains(strings.ToLower(vA), filter) && !strings.Contains(strings.ToLower(vB), filter) { continue }
+		if diffOnly && !isDiff {
+			continue
+		}
+		if filter != "" && !strings.Contains(strings.ToLower(name), filter) && !strings.Contains(strings.ToLower(vA), filter) && !strings.Contains(strings.ToLower(vB), filter) {
+			continue
+		}
 
 		rows = append(rows, DiffRow{PkgName: name, VersionA: vA, VersionB: vB, IsDiff: isDiff})
 	}
@@ -447,10 +488,14 @@ func handleExportINI(w http.ResponseWriter, r *http.Request) {
 	filtered, _, _ := filterAndSort(r) // Bypasses pagination to export all matches
 	hostMap := make(map[string]bool)
 	for _, item := range filtered {
-		if item.Hostname != "" { hostMap[item.Hostname] = true }
+		if item.Hostname != "" {
+			hostMap[item.Hostname] = true
+		}
 	}
 	var hosts []string
-	for h := range hostMap { hosts = append(hosts, h) }
+	for h := range hostMap {
+		hosts = append(hosts, h)
+	}
 	sort.Strings(hosts)
 
 	w.Header().Set("Content-Type", "text/plain")
@@ -463,7 +508,9 @@ func handleExportINI(w http.ResponseWriter, r *http.Request) {
 
 // --- Regex Matcher ---
 func createFieldMatcher(query string) func(string) bool {
-	if query == "" { return func(s string) bool { return true } }
+	if query == "" {
+		return func(s string) bool { return true }
+	}
 	if isLikelyRegex(query) {
 		if re, err := regexp.Compile("(?i)" + query); err == nil {
 			return func(s string) bool { return re.MatchString(s) }
@@ -473,7 +520,9 @@ func createFieldMatcher(query string) func(string) bool {
 	return func(s string) bool {
 		sLower := strings.ToLower(s)
 		for _, t := range terms {
-			if !strings.Contains(sLower, t) { return false }
+			if !strings.Contains(sLower, t) {
+				return false
+			}
 		}
 		return true
 	}
@@ -481,14 +530,22 @@ func createFieldMatcher(query string) func(string) bool {
 
 func isLikelyRegex(query string) bool {
 	for _, char := range []string{"^", "$", "*", "+", "?", "[", "]", "(", ")", "{", "}", "|", "\\"} {
-		if strings.Contains(query, char) { return true }
+		if strings.Contains(query, char) {
+			return true
+		}
 	}
 	return false
 }
 
 // --- HTML TEMPLATES ---
 var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
-	"isRegex": func(q string) string { if isLikelyRegex(q) { return "[REG]" } else { return "[TXT]" } },
+	"isRegex": func(q string) string {
+		if isLikelyRegex(q) {
+			return "[REG]"
+		} else {
+			return "[TXT]"
+		}
+	},
 }).Parse(`
 {{define "index"}}
 <!DOCTYPE html>
@@ -590,11 +647,11 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 </head>
 <body>
 
-    <!-- Header Panel -->
+		<!-- Header Panel -->
     <div class="panel header-panel">
         <div>
             <span class="badge bg-purple"> 📦 PKGDASH-WEB </span>
-            <span class="badge bg-cyan"> 🔒 HTTP </span>
+            <span class="badge bg-cyan"> {{.SecStatus}} </span>
             <span class="badge bg-green"> ✓ SYNCED </span>
         </div>
         <div class="text-muted" style="font-style: italic;">
