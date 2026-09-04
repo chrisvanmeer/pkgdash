@@ -26,17 +26,17 @@ import (
 )
 
 const (
-	defaultPort      = ":9876"
-	defaultDataPath  = "/tmp/pkgdash"
-	defaultOSVEnable = false
-	defaultOSVURL    = "https://api.osv.dev"
-	defaultOSVProxy  = ""
-	serviceName      = "pkgdashd"
-	installDir       = "/usr/local/bin"
-	osvCacheTTL      = 12 * time.Hour
-	osvHTTPTimeout   = 30 * time.Second
-	osvBatchSize     = 100
-	syncInterval     = 30 * time.Second
+	defaultPort        = ":9876"
+	defaultDataPath    = "/tmp/pkgdash"
+	defaultOSVEnable   = false
+	defaultOSVURL      = "https://api.osv.dev"
+	defaultOSVProxy    = ""
+	defaultOSVCacheTTL = 12 * time.Hour
+	serviceName        = "pkgdashd"
+	installDir         = "/usr/local/bin"
+	osvHTTPTimeout     = 30 * time.Second
+	osvBatchSize       = 100
+	syncInterval       = 30 * time.Second
 )
 
 var (
@@ -46,10 +46,11 @@ var (
 	previousState  = make(map[string]map[string]string)
 
 	// OSV Configuration
-	activeOSVEnabled bool
-	activeOSVURL     string
-	activeOSVProxy   string
-	osvHTTPClient    *http.Client
+	activeOSVEnabled  bool
+	activeOSVURL      string
+	activeOSVProxy    string
+	activeOSVCacheTTL time.Duration
+	osvHTTPClient     *http.Client
 
 	// OSV Cache
 	osvCacheMu sync.RWMutex
@@ -147,6 +148,7 @@ func main() {
 	osvEnableFlag := flag.Bool("enable-osv", defaultOSVEnable, "Enable OSV.dev vulnerability checking")
 	osvURLFlag := flag.String("osv-url", defaultOSVURL, "OSV API URL (or internal mirror)")
 	osvProxyFlag := flag.String("osv-proxy", defaultOSVProxy, "Proxy URL for OSV requests")
+	osvCacheTTLFlag := flag.Duration("osv-cache-ttl", defaultOSVCacheTTL, "OSV cache TTL duration (e.g. 6h, 12h, 24h)")
 
 	flag.Parse()
 
@@ -155,13 +157,14 @@ func main() {
 	activeOSVEnabled = *osvEnableFlag
 	activeOSVURL = strings.TrimRight(*osvURLFlag, "/")
 	activeOSVProxy = *osvProxyFlag
+	activeOSVCacheTTL = *osvCacheTTLFlag
 
 	if *installFlag && *uninstallFlag {
 		log.Fatal("Cannot use --install and --uninstall at the same time")
 	}
 
 	if *installFlag {
-		if err := installSystemdService(*portFlag, *dataPathFlag, *pskFlag, *tlsFlag, activeOSVEnabled, activeOSVURL, activeOSVProxy); err != nil {
+		if err := installSystemdService(*portFlag, *dataPathFlag, *pskFlag, *tlsFlag, activeOSVEnabled, activeOSVURL, activeOSVProxy, activeOSVCacheTTL); err != nil {
 			log.Fatalf("Failed to install systemd service: %v", err)
 		}
 		fmt.Printf("Systemd service installed successfully.\nListening on %s | Reading from %s\n", *portFlag, *dataPathFlag)
@@ -179,7 +182,7 @@ func main() {
 	if activeOSVEnabled {
 		initOSVHTTPClient()
 		loadOSVCacheFromDisk()
-		log.Printf("OSV vulnerability integration ENABLED (API: %s)", activeOSVURL)
+		log.Printf("OSV vulnerability integration ENABLED (API: %s | Cache TTL: %s)", activeOSVURL, activeOSVCacheTTL)
 	}
 
 	historyMgr = NewHistoryManager(activeDataPath)
@@ -412,14 +415,14 @@ func enrichWithOSV(hosts []HostPayload) {
 	for pk := range uniquePkgs {
 		key := pk.Name + "@" + pk.Version + "@" + pk.Ecosystem
 		entry, exists := osvCache[key]
-		if !exists || time.Since(entry.FetchedAt) > osvCacheTTL {
+		if !exists || time.Since(entry.FetchedAt) > activeOSVCacheTTL {
 			toFetch = append(toFetch, pk)
 		}
 	}
 	osvCacheMu.RUnlock()
 
 	if len(toFetch) > 0 {
-		log.Printf("Querying OSV.dev API for %d packages (with Ecosystem mapping)...", len(toFetch))
+		log.Printf("Querying OSV.dev API for %d packages (Cache TTL: %s)...", len(toFetch), activeOSVCacheTTL)
 		fetchOSVBatch(toFetch)
 	}
 
@@ -620,11 +623,11 @@ func ensureTLSCerts(certPath, keyPath string) error {
 }
 
 func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
+	s, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = sourceFile.Close() }()
+	defer func() { _ = s.Close() }()
 
 	destFile, err := os.Create(dst)
 	if err != nil {
@@ -632,11 +635,11 @@ func copyFile(src, dst string) error {
 	}
 	defer func() { _ = destFile.Close() }()
 
-	_, err = io.Copy(destFile, sourceFile)
+	_, err = io.Copy(destFile, s)
 	return err
 }
 
-func installSystemdService(port, dataPath, psk string, tlsEnabled, osvEnabled bool, osvURL, osvProxy string) error {
+func installSystemdService(port, dataPath, psk string, tlsEnabled, osvEnabled bool, osvURL, osvProxy string, osvCacheTTL time.Duration) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -670,6 +673,9 @@ func installSystemdService(port, dataPath, psk string, tlsEnabled, osvEnabled bo
 		}
 		if osvProxy != "" {
 			execCmd += fmt.Sprintf(" --osv-proxy=%q", osvProxy)
+		}
+		if osvCacheTTL != defaultOSVCacheTTL {
+			execCmd += fmt.Sprintf(" --osv-cache-ttl=%q", osvCacheTTL.String())
 		}
 	}
 
