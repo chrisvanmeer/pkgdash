@@ -248,6 +248,10 @@ type model struct {
 	selectedHost   FlatItem
 	hostModalTab   int // 0: Overview, 1: History
 
+	// New: Event Detail Modal
+	showEventDetailModal bool
+	selectedEvent        ChangeEvent
+
 	// Fleet History (Time Travel)
 	showHistoryView bool
 	historyEvents   []ChangeEvent
@@ -661,8 +665,8 @@ func (m *model) updateHostHistoryViewport() {
 
 	if m.hostHistoryCursor < m.hostHistoryOffset {
 		m.hostHistoryOffset = m.hostHistoryCursor
-	} else if m.hostHistoryCursor >= m.hostHistoryOffset+5 {
-		m.hostHistoryOffset = m.hostHistoryCursor - 5 + 1
+	} else if m.hostHistoryCursor >= m.hostHistoryOffset+6 { // Increased to 6 to show more rows
+		m.hostHistoryOffset = m.hostHistoryCursor - 6 + 1
 	}
 }
 
@@ -916,13 +920,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 1. Fleet History (Time Travel) View
+	// 1. Event Detail Popup Modal (Appears over History or Host modals)
+	if m.showEventDetailModal {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc", "enter", "ctrl+c":
+				m.showEventDetailModal = false
+				return m, nil
+			}
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+		}
+		return m, nil
+	}
+
+	// 2. Fleet History (Time Travel) View
 	if m.showHistoryView {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.String() {
 			case "esc", "ctrl+y":
 				m.showHistoryView = false
+				return m, nil
+
+			case "enter":
+				// Open details modal for the selected event
+				if len(m.historyEvents) > 0 && m.historyCursor < len(m.historyEvents) {
+					m.selectedEvent = m.historyEvents[m.historyCursor]
+					m.showEventDetailModal = true
+				}
 				return m, nil
 
 			case "up", "ctrl+k":
@@ -954,7 +982,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 2. About or Host Detail Modals
+	// 3. About or Host Detail Modals
 	if m.showAboutModal || m.showHostModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -967,6 +995,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if m.showAboutModal {
 					m.showAboutModal = false
+				} else if m.showHostModal && m.hostModalTab == 1 {
+					// Open detail for the selected host history event
+					if len(m.hostHistoryEvents) > 0 && m.hostHistoryCursor < len(m.hostHistoryEvents) {
+						m.selectedEvent = m.hostHistoryEvents[m.hostHistoryCursor]
+						m.showEventDetailModal = true
+					}
 				} else {
 					m.showHostModal = false
 				}
@@ -1002,7 +1036,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 3. Diff Host Selection Modal
+	// 4. Diff Host Selection Modal
 	if m.showDiffSelectModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1080,7 +1114,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// 4. Diff View Modal
+	// 5. Diff View Modal
 	if m.showDiffViewModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1139,7 +1173,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// 5. Main View Keyboard Navigation
+	// 6. Main View Keyboard Navigation
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" {
@@ -1413,7 +1447,32 @@ func (m model) View() string {
 		return "Initializing Dashboard..."
 	}
 
-	// 1. About Modal
+	// 1. Event Detail Popup Modal (Appears over History or Host modals)
+	if m.showEventDetailModal {
+		evt := m.selectedEvent
+		evtTitle := fmt.Sprintf(" PACKAGE AUDIT EVENT: %s ", evt.Package)
+
+		details := lipgloss.JoinVertical(lipgloss.Left,
+			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Timestamp:   "), rowStyleNormal.Render(evt.Timestamp.Local().Format("2006-01-02 15:04:05"))),
+			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Server:      "), rowStyleNormal.Render(evt.Hostname)),
+			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Action:      "), renderActionBadge(evt.Action)),
+			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Package:     "), rowStyleNormal.Render(evt.Package)),
+			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("Old Version: "), rowStyleNormal.Render(evt.OldVersion)),
+			lipgloss.JoinHorizontal(lipgloss.Left, labelFocused.Render("New Version: "), rowStyleNormal.Render(evt.NewVersion)),
+		)
+
+		modalContent := lipgloss.JoinVertical(lipgloss.Center,
+			titleBadge.Render(evtTitle),
+			"",
+			details,
+			"",
+			lipgloss.NewStyle().Foreground(cMuted).Render("[Press Esc or Enter to close]"),
+		)
+		dialog := modalStyle.Render(modalContent)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+	}
+
+	// 2. About Modal
 	if m.showAboutModal {
 		modalContent := lipgloss.JoinVertical(lipgloss.Center,
 			titleBadge.Render(" PKGDASH CONTROL CENTER "),
@@ -1429,17 +1488,35 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 2. Fleet History View (Ctrl+Y)
+	// 3. Fleet History View (Ctrl+Y) - Expanded columns and proper alignment
 	if m.showHistoryView {
 		innerWidth := m.width - 10
-		if innerWidth < 60 {
-			innerWidth = 60
+		if innerWidth < 90 {
+			innerWidth = 90
 		}
 
 		titleBar := titleBadge.Render(" 📜 FLEET AUDIT LOG / TIME TRAVEL ")
 
+		colTimeW := 18
+		colHostW := int(float64(innerWidth) * 0.28)
+		colActionW := 13
+		colPkgW := int(float64(innerWidth) * 0.25)
+		colVerW := innerWidth - colTimeW - colHostW - colActionW - colPkgW
+
+		if colVerW < 10 {
+			colVerW = 10
+		}
+
+		hdrTime := tableHeaderStyle.Width(colTimeW).MaxWidth(colTimeW).Render(" TIMESTAMP")
+		hdrHost := tableHeaderStyle.Width(colHostW).MaxWidth(colHostW).Render(" HOSTNAME")
+		hdrAction := tableHeaderStyle.Width(colActionW).MaxWidth(colActionW).Render(" ACTION")
+		hdrPkg := tableHeaderStyle.Width(colPkgW).MaxWidth(colPkgW).Render(" PACKAGE")
+		hdrVer := tableHeaderStyle.Width(colVerW).MaxWidth(colVerW).Render(" VERSION DETAILS")
+
+		tableHdr := lipgloss.JoinHorizontal(lipgloss.Left, hdrTime, hdrHost, hdrAction, hdrPkg, hdrVer)
+
 		start := m.historyOffset
-		end := m.historyOffset + m.visibleLines
+		end := m.historyOffset + m.visibleLines - 1
 		if end > len(m.historyEvents) {
 			end = len(m.historyEvents)
 		}
@@ -1453,42 +1530,48 @@ func (m model) View() string {
 				absIndex := start + i
 				isSelected := absIndex == m.historyCursor
 
-				badge := renderActionBadge(evt.Action)
-				timeStr := evt.Timestamp.Local().Format("2006-01-02 15:04")
+				timeStr := " " + evt.Timestamp.Local().Format("2006-01-02 15:04")
+				hostStr := " " + evt.Hostname
+				badgeStr := renderActionBadge(evt.Action)
+				pkgStr := " " + evt.Package
 
-				details := fmt.Sprintf("%s -> %s", evt.OldVersion, evt.NewVersion)
-				if evt.Action == "ADDED" {
-					details = evt.NewVersion
-				} else if evt.Action == "REMOVED" {
-					details = evt.OldVersion
+				var verDetail string
+				if evt.Action == "MODIFIED" {
+					verDetail = fmt.Sprintf(" %s -> %s", evt.OldVersion, evt.NewVersion)
+				} else if evt.Action == "ADDED" {
+					verDetail = " " + evt.NewVersion
+				} else {
+					verDetail = " " + evt.OldVersion
 				}
-
-				line := fmt.Sprintf("[%s] %s  %s  %s  (%s)",
-					timeStr,
-					lipgloss.NewStyle().Foreground(cCyan).Render(evt.Hostname),
-					badge,
-					lipgloss.NewStyle().Foreground(cText).Bold(true).Render(evt.Package),
-					details,
-				)
 
 				if isSelected {
-					line = selectedStyle.Width(innerWidth).Render(truncate("❯ "+line, innerWidth))
-				} else {
-					line = truncate("  "+line, innerWidth)
-				}
+					cTime := selectedStyle.Width(colTimeW).MaxWidth(colTimeW).Render(truncate(timeStr, colTimeW))
+					cHost := selectedStyle.Width(colHostW).MaxWidth(colHostW).Render(truncate(hostStr, colHostW))
+					cBadge := badgeStr
+					cPkg := selectedStyle.Width(colPkgW).MaxWidth(colPkgW).Render(truncate(pkgStr, colPkgW))
+					cVer := selectedStyle.Width(colVerW).MaxWidth(colVerW).Render(truncate(verDetail, colVerW))
 
-				rowStrs = append(rowStrs, line)
+					rowStrs = append(rowStrs, lipgloss.JoinHorizontal(lipgloss.Left, cTime, cHost, cBadge, cPkg, cVer))
+				} else {
+					cTime := rowStyleNormal.Width(colTimeW).MaxWidth(colTimeW).Render(truncate(timeStr, colTimeW))
+					cHost := lipgloss.NewStyle().Foreground(cCyan).Width(colHostW).MaxWidth(colHostW).Render(truncate(hostStr, colHostW))
+					cBadge := badgeStr
+					cPkg := lipgloss.NewStyle().Foreground(cText).Bold(true).Width(colPkgW).MaxWidth(colPkgW).Render(truncate(pkgStr, colPkgW))
+					cVer := lipgloss.NewStyle().Foreground(cMuted).Width(colVerW).MaxWidth(colVerW).Render(truncate(verDetail, colVerW))
+
+					rowStrs = append(rowStrs, lipgloss.JoinHorizontal(lipgloss.Left, cTime, cHost, cBadge, cPkg, cVer))
+				}
 			}
 		}
 
-		for i := len(rowStrs); i < m.visibleLines; i++ {
+		for i := len(rowStrs); i < m.visibleLines-1; i++ {
 			rowStrs = append(rowStrs, "")
 		}
 
-		historyBody := strings.Join(rowStrs, "\n")
+		historyBody := lipgloss.JoinVertical(lipgloss.Left, tableHdr, strings.Join(rowStrs, "\n"))
 		frame := panelStyle.BorderForeground(cPurple).Width(innerWidth + 4).Render(historyBody)
 
-		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Esc / Ctrl+Y] Close History View")
+		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Enter] Inspect Event Details  |  [Esc / Ctrl+Y] Close History View")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -1502,7 +1585,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 3. Host Detail Modal (With Overview vs History Tabs)
+	// 4. Host Detail Modal (With Strictly Aligned Columns for History Tab)
 	if m.showHostModal {
 		osStr := strings.TrimSpace(m.selectedHost.OSName + " " + m.selectedHost.OSVersion)
 		if osStr == "" {
@@ -1546,26 +1629,40 @@ func (m model) View() string {
 				bodyContent = lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render("No package changes recorded for this host.")
 			} else {
 				start := m.hostHistoryOffset
-				end := m.hostHistoryOffset + 5
+				end := m.hostHistoryOffset + 6
 				if end > len(m.hostHistoryEvents) {
 					end = len(m.hostHistoryEvents)
 				}
+
+				// Strict Column widths for Host Modal History
+				col1W := 14 // Date
+				col3W := 24 // Package Name
+				col4W := 30 // Version Details
 
 				var rows []string
 				viewport := m.hostHistoryEvents[start:end]
 				for i, evt := range viewport {
 					absIdx := start + i
-					badge := renderActionBadge(evt.Action)
-					timeStr := evt.Timestamp.Local().Format("01-02 15:04")
+					timeStr := " " + evt.Timestamp.Local().Format("01-02 15:04")
+					badgeStr := renderActionBadge(evt.Action)
+					pkgStr := " " + evt.Package
 
-					details := fmt.Sprintf("%s -> %s", evt.OldVersion, evt.NewVersion)
-					if evt.Action == "ADDED" {
-						details = evt.NewVersion
-					} else if evt.Action == "REMOVED" {
-						details = evt.OldVersion
+					var verDetail string
+					if evt.Action == "MODIFIED" {
+						verDetail = fmt.Sprintf(" %s -> %s", evt.OldVersion, evt.NewVersion)
+					} else if evt.Action == "ADDED" {
+						verDetail = " " + evt.NewVersion
+					} else {
+						verDetail = " " + evt.OldVersion
 					}
 
-					line := fmt.Sprintf("[%s] %s %s (%s)", timeStr, badge, evt.Package, details)
+					cTime := rowStyleNormal.Width(col1W).MaxWidth(col1W).Render(truncate(timeStr, col1W))
+					cBadge := badgeStr
+					cPkg := lipgloss.NewStyle().Foreground(cText).Bold(true).Width(col3W).MaxWidth(col3W).Render(truncate(pkgStr, col3W))
+					cVer := lipgloss.NewStyle().Foreground(cMuted).Width(col4W).MaxWidth(col4W).Render(truncate(verDetail, col4W))
+
+					line := lipgloss.JoinHorizontal(lipgloss.Left, cTime, cBadge, cPkg, cVer)
+
 					if absIdx == m.hostHistoryCursor {
 						line = selectedStyle.Render(line)
 					}
@@ -1582,13 +1679,13 @@ func (m model) View() string {
 			"",
 			bodyContent,
 			"",
-			lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Tab  |  [Esc / Enter] Close"),
+			lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Tab  |  [Enter] Inspect Event Details  |  [Esc] Close"),
 		)
 		dialog := modalStyle.Render(modalContent)
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 4. Diff Selection Modal with Styled Typeahead
+	// 5. Diff Selection Modal with Styled Typeahead
 	if m.showDiffSelectModal {
 		titleBar := titleBadge.Render(" ⚔️ COMPARE HOST PACKAGES (DIFF) ")
 
@@ -1643,7 +1740,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 5. Diff View Modal
+	// 6. Diff View Modal
 	if m.showDiffViewModal {
 		modalOuterW := m.width - 10
 		if modalOuterW < 70 {
@@ -1787,7 +1884,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 6. Main Dashboard View
+	// 7. Main Dashboard View
 	availWidth := m.width - 2
 	if availWidth < 60 {
 		return "Terminal window too small..."

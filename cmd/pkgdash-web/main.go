@@ -212,10 +212,14 @@ func fetchAllData(servers []string, psk string) {
 				for _, host := range payload {
 					for _, pkg := range host.Packages {
 						localItems = append(localItems, FlatItem{
-							Hostname: host.Hostname, IPAddress: host.IPAddress,
-							OSName: host.OSName, OSVersion: host.OSVersion,
-							HostFunction: host.HostFunction, PkgName: pkg.Name,
-							Version: pkg.Version, Arch: pkg.Arch,
+							Hostname:     host.Hostname,
+							IPAddress:    host.IPAddress,
+							OSName:       host.OSName,
+							OSVersion:    host.OSVersion,
+							HostFunction: host.HostFunction,
+							PkgName:      pkg.Name,
+							Version:      pkg.Version,
+							Arch:         pkg.Arch,
 						})
 					}
 				}
@@ -400,7 +404,7 @@ func handleTable(w http.ResponseWriter, r *http.Request) {
 
 	stats := ""
 	if r.URL.Query().Get("pkg") != "" && len(filtered) > 0 {
-		stats = fmt.Sprintf("📊 Fleet Insights (filtered search results): '%s' is present on %d host(s) across %d unique version(s)", r.URL.Query().Get("pkg"), hCount, vCount)
+		stats = fmt.Sprintf("📊 Fleet Insights: '%s' is present on %d host(s) across %d unique version(s)", r.URL.Query().Get("pkg"), hCount, vCount)
 	}
 
 	sortCol := r.URL.Query().Get("sort")
@@ -443,7 +447,6 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	dataMutex.RUnlock()
-
 	_ = tmpl.ExecuteTemplate(w, "modal_host", host)
 }
 
@@ -582,6 +585,7 @@ func handleExportINI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// --- Regex Matcher ---
 func createFieldMatcher(query string) func(string) bool {
 	if query == "" {
 		return func(s string) bool { return true }
@@ -621,7 +625,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 		return "[TXT]"
 	},
 	"formatTime": func(t time.Time) string {
-		return t.Local().Format("2006-01-02 15:04")
+		return t.Local().Format("2006-01-02 15:04:05")
 	},
 }).Parse(`
 {{define "index"}}
@@ -631,6 +635,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pkgdash Web</title>
+    <!-- Embedded SVG Favicon -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <style>
@@ -641,6 +646,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             --yellow: #F1FA8C; --red: #FF5555; --dark-text: #11111B;
         }
 
+        /* Unified Flex Layout */
         body {
             background: var(--bg);
             color: var(--text);
@@ -659,7 +665,11 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .panel { border: 2px solid var(--border); border-radius: 8px; padding: 0.5rem; }
         .header-panel { border-color: var(--purple); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
         .badge { padding: 0.1rem 0.5rem; font-weight: bold; color: var(--dark-text); display: inline-block; margin-right: 0.5rem; }
-        .bg-purple { background: var(--purple); } .bg-cyan { background: var(--cyan); } .bg-green { background: var(--green); } .bg-yellow { background: var(--yellow); } .bg-red { background: var(--red); color: white; }
+        .bg-purple { background: var(--purple); } 
+        .bg-cyan { background: var(--cyan); } 
+        .bg-green { background: var(--green); } 
+        .bg-yellow { background: var(--yellow); } 
+        .bg-red { background: var(--red); color: white; }
 
         .flex { display: flex; gap: 1rem; flex-shrink: 0; }
         .filter-card { flex: 1; border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; transition: border 0.2s; }
@@ -671,10 +681,13 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         input[type="text"] { background: transparent; border: none; color: var(--text); font-family: inherit; width: 100%; outline: none; margin-left: 0.5rem; }
 
         #filter-form { margin: 0; }
+
+        /* Main table container */
         #table-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 0; position: relative; }
 
         table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 
+        /* Sticky table headers */
         th {
             background: var(--surface);
             color: var(--text);
@@ -688,7 +701,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             box-shadow: 0 2px 2px rgba(0,0,0,0.1);
         }
 
-        td { padding: 0.2rem 0.5rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        td { padding: 0.3rem 0.5rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         tr:hover td { background: var(--pink); color: var(--dark-text); cursor: pointer; }
 
         .insights { color: var(--cyan); font-style: italic; padding: 0.5rem; border-top: 1px solid var(--border); position: sticky; bottom: 0; background: var(--bg); z-index: 10;}
@@ -697,9 +710,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .btn-link { color: var(--muted); text-decoration: none; cursor: pointer; padding: 0 0.5rem; }
         .btn-link:hover { color: var(--pink); }
 
+        /* Modals - Expanded width to 1150px to prevent text wrapping */
         dialog { background: var(--bg); color: var(--text); border: 3px double var(--purple); border-radius: 8px; padding: 1.5rem; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        dialog#diffModal, dialog#timelineModal { max-width: 1100px; }
-        dialog#aboutModal, dialog#hostModal { max-width: 800px; }
+        dialog#diffModal, dialog#timelineModal, dialog#hostModal { max-width: 1150px; }
+        dialog#aboutModal { max-width: 600px; }
         dialog::backdrop { background: rgba(0,0,0,0.7); }
         .modal-header { font-weight: bold; margin-bottom: 1rem; text-align: center; }
         .text-pink { color: var(--pink); } .text-cyan { color: var(--cyan); }
@@ -707,15 +721,21 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         button { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 0.4rem 1rem; cursor: pointer; font-family: inherit; }
         button:hover { background: var(--pink); color: var(--dark-text); }
 
-        .tab-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 0.3rem 0.8rem; margin-right: 0.5rem; cursor: pointer; }
-        .tab-btn.active { border-color: var(--pink); color: var(--pink); font-weight: bold; }
+        .tab-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 0.4rem 1rem; margin-right: 0.5rem; cursor: pointer; }
+        .tab-btn.active { border-color: var(--pink); color: var(--pink); font-weight: bold; background: var(--surface); }
 
+        /* Diff Table specific */
         .diff-table { font-size: 13px; }
         .diff-table th { background: var(--bg); border-bottom: 2px solid var(--border); box-shadow: none; }
         .diff-table td { border-bottom: 1px solid #313244; }
         .diff-table tr.is-diff td.diff-col { font-weight: bold; }
         .diff-table tr.is-diff td.diff-col-a { color: var(--cyan); }
         .diff-table tr.is-diff td.diff-col-b { color: var(--pink); }
+
+        /* Audit History Tables */
+        .history-table { width: 100%; font-size: 13px; border-collapse: collapse; table-layout: fixed; }
+        .history-table th { background: var(--surface); padding: 0.5rem; text-align: left; border-bottom: 2px solid var(--border); }
+        .history-table td { padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--surface); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     </style>
 </head>
 <body>
@@ -800,6 +820,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             window.location.href = endpoint + '?' + params;
         }
 
+        // Handle Table Sorting
         document.body.addEventListener('click', function(evt) {
             if (evt.target.matches('th[data-sort]')) {
                 const sortInput = document.getElementById('sort-col');
@@ -816,6 +837,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             }
         });
 
+        // Regex indicator updater
         document.querySelectorAll('input[type="text"]').forEach(input => {
             input.addEventListener('input', (e) => {
                 const isReg = /[\\^\$\*\+\?\[\]\(\)\{\}\|]/.test(e.target.value);
@@ -824,6 +846,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             });
         });
 
+        // Modal Close on click outside
         document.querySelectorAll('dialog').forEach(dialog => {
             dialog.addEventListener('click', (e) => {
                 const rect = dialog.getBoundingClientRect();
@@ -882,32 +905,32 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 {{define "modal_host"}}
     <div class="modal-header"><span class="badge bg-purple" style="text-transform: uppercase;"> HOST INFORMATION: {{.Hostname}} </span></div>
     
-    <div style="margin-bottom: 1rem; text-align: center;">
+    <div style="margin-bottom: 1.5rem; text-align: center;">
         <button class="tab-btn active" onclick="document.getElementById('tab-overview').style.display='block'; document.getElementById('tab-history').style.display='none'; this.classList.add('active'); this.nextElementSibling.classList.remove('active');">Overview</button>
         <button class="tab-btn" hx-get="/modal/host/history?h={{.Hostname}}" hx-target="#tab-history" onclick="document.getElementById('tab-overview').style.display='none'; document.getElementById('tab-history').style.display='block'; this.classList.add('active'); this.previousElementSibling.classList.remove('active');">Change History</button>
     </div>
 
-    <div id="tab-overview" style="margin-left: 2rem; line-height: 1.8;">
-        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">Hostname:</span> {{.Hostname}}</div>
-        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">IP Address:</span> {{if .IPAddress}}{{.IPAddress}}{{else}}Unknown{{end}}</div>
-        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">OS:</span> {{if .OSName}}{{.OSName}} {{.OSVersion}}{{else}}Unknown{{end}}</div>
-        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 120px;">Host Function:</span> {{if .HostFunction}}{{.HostFunction}}{{else}}-{{end}}</div>
+    <div id="tab-overview" style="margin-left: 2rem; line-height: 2;">
+        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Hostname:</span> {{.Hostname}}</div>
+        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">IP Address:</span> {{if .IPAddress}}{{.IPAddress}}{{else}}Unknown{{end}}</div>
+        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">OS:</span> {{if .OSName}}{{.OSName}} {{.OSVersion}}{{else}}Unknown{{end}}</div>
+        <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Host Function:</span> {{if .HostFunction}}{{.HostFunction}}{{else}}-{{end}}</div>
     </div>
 
-    <div id="tab-history" style="display:none; max-height: 300px; overflow-y: auto;">
+    <div id="tab-history" style="display:none; max-height: 400px; overflow-y: auto;">
         <!-- Loaded via HTMX -->
     </div>
 {{end}}
 
 {{define "modal_host_history"}}
     {{if .Events}}
-    <table style="width:100%; font-size:12px;">
+    <table class="history-table">
         <thead>
-            <tr style="border-bottom: 1px solid var(--border);">
-                <th style="width:120px;">Timestamp</th>
-                <th style="width:90px;">Action</th>
-                <th>Package</th>
-                <th>Details</th>
+            <tr>
+                <th style="width:180px;">TIMESTAMP</th>
+                <th style="width:130px;">ACTION</th>
+                <th style="width:280px;">PACKAGE NAME</th>
+                <th>VERSION DETAILS</th>
             </tr>
         </thead>
         <tbody>
@@ -919,10 +942,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
                     {{if eq .Action "MODIFIED"}}<span class="badge bg-cyan">~ MODIFIED</span>{{end}}
                     {{if eq .Action "REMOVED"}}<span class="badge bg-red">- REMOVED</span>{{end}}
                 </td>
-                <td style="font-weight:bold;">{{.Package}}</td>
-                <td style="color:var(--muted);">
+                <td style="font-weight:bold; color:var(--text);">{{.Package}}</td>
+                <td style="color:var(--muted); font-family: monospace;">
                     {{if eq .Action "ADDED"}}{{.NewVersion}}{{end}}
-                    {{if eq .Action "MODIFIED"}}{{.OldVersion}} &rarr; {{.NewVersion}}{{end}}
+                    {{if eq .Action "MODIFIED"}}{{.OldVersion}} &rarr; <span style="color:var(--green); font-weight:bold;">{{.NewVersion}}</span>{{end}}
                     {{if eq .Action "REMOVED"}}{{.OldVersion}}{{end}}
                 </td>
             </tr>
@@ -930,23 +953,23 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         </tbody>
     </table>
     {{else}}
-    <div style="text-align:center; padding: 1rem; color:var(--muted); font-style:italic;">No package change history recorded for this host.</div>
+    <div style="text-align:center; padding: 2rem; color:var(--muted); font-style:italic;">No package change history recorded for this host.</div>
     {{end}}
 {{end}}
 
 {{define "modal_timeline"}}
     <div class="modal-header"><span class="badge bg-purple"> 📜 FLEET AUDIT LOG / TIME TRAVEL </span></div>
     
-    <div style="max-height: 450px; overflow-y: auto;">
+    <div style="max-height: 500px; overflow-y: auto;">
         {{if .}}
-        <table style="width:100%; font-size:13px;">
-            <thead style="position:sticky; top:0; background:var(--bg);">
-                <tr style="border-bottom: 2px solid var(--border);">
-                    <th style="width:140px;">Timestamp</th>
-                    <th style="width:180px;">Host</th>
-                    <th style="width:100px;">Action</th>
-                    <th>Package</th>
-                    <th>Details</th>
+        <table class="history-table">
+            <thead style="position:sticky; top:0; z-index:5;">
+                <tr>
+                    <th style="width:180px;">TIMESTAMP</th>
+                    <th style="width:260px;">HOSTNAME</th>
+                    <th style="width:130px;">ACTION</th>
+                    <th style="width:260px;">PACKAGE NAME</th>
+                    <th>VERSION DETAILS</th>
                 </tr>
             </thead>
             <tbody>
@@ -959,10 +982,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
                         {{if eq .Action "MODIFIED"}}<span class="badge bg-cyan">~ MODIFIED</span>{{end}}
                         {{if eq .Action "REMOVED"}}<span class="badge bg-red">- REMOVED</span>{{end}}
                     </td>
-                    <td style="font-weight:bold;">{{.Package}}</td>
-                    <td style="color:var(--muted);">
+                    <td style="font-weight:bold; color:var(--text);">{{.Package}}</td>
+                    <td style="color:var(--muted); font-family: monospace;">
                         {{if eq .Action "ADDED"}}{{.NewVersion}}{{end}}
-                        {{if eq .Action "MODIFIED"}}{{.OldVersion}} &rarr; {{.NewVersion}}{{end}}
+                        {{if eq .Action "MODIFIED"}}{{.OldVersion}} &rarr; <span style="color:var(--green); font-weight:bold;">{{.NewVersion}}</span>{{end}}
                         {{if eq .Action "REMOVED"}}{{.OldVersion}}{{end}}
                     </td>
                 </tr>
