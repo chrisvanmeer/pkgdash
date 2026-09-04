@@ -427,6 +427,7 @@ func getConfig() ([]string, string) {
 					servers = append(servers, line)
 				}
 			}
+			_ = scanner.Err()
 		}
 	}
 	return servers, psk
@@ -886,7 +887,8 @@ func saveInventory(items []FlatItem) string {
 	var sb strings.Builder
 	sb.WriteString("[all]\n")
 	for _, h := range hosts {
-		sb.WriteString(h + "\n")
+		sb.WriteString(h)
+		sb.WriteString("\n")
 	}
 
 	if _, err := file.WriteString(sb.String()); err != nil {
@@ -1027,7 +1029,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 1. OSV Vulnerability Detail Modal (Fully Scrollable & Strictly Bounded)
+	// 1. OSV Vulnerability Detail Modal
 	if m.showOSVModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1749,11 +1751,12 @@ func (m model) View() string {
 				badgeStr := renderActionBadge(evt.Action)
 
 				var verDetail string
-				if evt.Action == "MODIFIED" {
+				switch evt.Action {
+				case "MODIFIED":
 					verDetail = fmt.Sprintf(" %s -> %s", evt.OldVersion, evt.NewVersion)
-				} else if evt.Action == "ADDED" {
+				case "ADDED":
 					verDetail = " " + evt.NewVersion
-				} else {
+				default:
 					verDetail = " " + evt.OldVersion
 				}
 
@@ -1858,11 +1861,12 @@ func (m model) View() string {
 				pkgStr := " " + evt.Package
 
 				var verDetail string
-				if evt.Action == "MODIFIED" {
+				switch evt.Action {
+				case "MODIFIED":
 					verDetail = fmt.Sprintf(" %s -> %s", evt.OldVersion, evt.NewVersion)
-				} else if evt.Action == "ADDED" {
+				case "ADDED":
 					verDetail = " " + evt.NewVersion
-				} else {
+				default:
 					verDetail = " " + evt.OldVersion
 				}
 
@@ -1907,7 +1911,7 @@ func (m model) View() string {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
-	// 5. Host Detail Modal (Left-aligned & Fixed Padding)
+	// 5. Host Detail Modal
 	if m.showHostModal {
 		osStr := strings.TrimSpace(m.selectedHost.OSName + " " + m.selectedHost.OSVersion)
 		if osStr == "" {
@@ -2000,11 +2004,12 @@ func (m model) View() string {
 					pkgStr := " " + evt.Package
 
 					var verDetail string
-					if evt.Action == "MODIFIED" {
+					switch evt.Action {
+					case "MODIFIED":
 						verDetail = fmt.Sprintf(" %s -> %s", evt.OldVersion, evt.NewVersion)
-					} else if evt.Action == "ADDED" {
+					case "ADDED":
 						verDetail = " " + evt.NewVersion
-					} else {
+					default:
 						verDetail = " " + evt.OldVersion
 					}
 
