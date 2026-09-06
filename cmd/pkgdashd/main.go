@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +59,10 @@ var (
 	osvCacheMu sync.RWMutex
 	osvCache   = make(map[string]osvCacheEntry)
 	isScanning bool
+
+	// Vulnerability Details Hydration Cache
+	vulnDetailsCacheMu sync.RWMutex
+	vulnDetailsCache   = make(map[string]osvVuln)
 )
 
 type pkgKey struct {
@@ -77,12 +83,12 @@ var (
 	cachedModTime time.Time
 )
 
+// Vulnerability represents a vulnerability item. All fields are explicitly serialized in JSON.
 type Vulnerability struct {
-	ID      string   `json:"id"`
-	CVE     []string `json:"cve,omitempty"`
-	Summary string   `json:"summary,omitempty"`
-	Details string   `json:"details,omitempty"`
-	URL     string   `json:"url,omitempty"`
+	ID       string  `json:"id"`
+	Details  string  `json:"details"`
+	URL      string  `json:"url"`
+	Severity float64 `json:"severity"`
 }
 
 type PackageInfo struct {
@@ -124,12 +130,25 @@ type osvResult struct {
 	Vulns []osvVuln `json:"vulns"`
 }
 
+type osvSeverity struct {
+	Type  string `json:"type"`
+	Score string `json:"score"`
+}
+
+type osvAffected struct {
+	Package  osvPackage    `json:"package"`
+	Severity []osvSeverity `json:"severity,omitempty"`
+}
+
 type osvVuln struct {
-	ID         string         `json:"id"`
-	Summary    string         `json:"summary"`
-	Details    string         `json:"details"`
-	Aliases    []string       `json:"aliases"`
-	References []osvReference `json:"references"`
+	ID               string                 `json:"id"`
+	Summary          string                 `json:"summary"`
+	Details          string                 `json:"details"`
+	Aliases          []string               `json:"aliases"`
+	References       []osvReference         `json:"references"`
+	Severity         []osvSeverity          `json:"severity,omitempty"`
+	Affected         []osvAffected          `json:"affected,omitempty"`
+	DatabaseSpecific map[string]interface{} `json:"database_specific,omitempty"`
 }
 
 type osvReference struct {
@@ -158,6 +177,286 @@ func getEnvDurationOrDefault(key string, defaultValue time.Duration) time.Durati
 		}
 	}
 	return defaultValue
+}
+
+// calculateCVSSv3BaseScore calculates the numeric base score from a CVSS 3.0/3.1 vector string.
+func calculateCVSSv3BaseScore(vector string) float64 {
+	parts := strings.Split(vector, "/")
+	metrics := make(map[string]string)
+	for _, part := range parts {
+		kv := strings.Split(part, ":")
+		if len(kv) == 2 {
+			metrics[kv[0]] = kv[1]
+		}
+	}
+
+	avMap := map[string]float64{"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+	acMap := map[string]float64{"L": 0.77, "H": 0.44}
+	uiMap := map[string]float64{"N": 0.85, "R": 0.62}
+	ciaMap := map[string]float64{"H": 0.56, "L": 0.22, "N": 0.0}
+
+	scope := metrics["S"]
+	prMap := map[string]float64{"N": 0.85, "L": 0.62, "H": 0.27}
+	if scope == "C" {
+		prMap["L"] = 0.68
+		prMap["H"] = 0.50
+	}
+
+	av, ok1 := avMap[metrics["AV"]]
+	ac, ok2 := acMap[metrics["AC"]]
+	pr, ok3 := prMap[metrics["PR"]]
+	ui, ok4 := uiMap[metrics["UI"]]
+	c, ok5 := ciaMap[metrics["C"]]
+	i, ok6 := ciaMap[metrics["I"]]
+	a, ok7 := ciaMap[metrics["A"]]
+
+	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || !ok7 {
+		return 0.0
+	}
+
+	iss := 1.0 - ((1.0 - c) * (1.0 - i) * (1.0 - a))
+	if iss <= 0 {
+		return 0.0
+	}
+
+	var impact float64
+	switch scope {
+	case "U":
+		impact = 6.42 * iss
+	case "C":
+		impact = 7.52*(iss-0.029) - 3.25*math.Pow(iss-0.02, 15)
+	default:
+		return 0.0
+	}
+
+	exploitability := 8.22 * av * ac * pr * ui
+
+	var baseScore float64
+	if impact <= 0 {
+		baseScore = 0.0
+	} else {
+		switch scope {
+		case "U":
+			baseScore = math.Min(impact+exploitability, 10.0)
+		case "C":
+			baseScore = math.Min(1.08*(impact+exploitability), 10.0)
+		default:
+			baseScore = 0.0
+		}
+	}
+
+	return math.Ceil(baseScore*10.0) / 10.0
+}
+
+// calculateCVSSv4BaseScore provides an estimate for CVSS v4.0 vectors.
+func calculateCVSSv4BaseScore(vector string) float64 {
+	parts := strings.Split(vector, "/")
+	metrics := make(map[string]string)
+	for _, part := range parts {
+		kv := strings.Split(part, ":")
+		if len(kv) == 2 {
+			metrics[kv[0]] = kv[1]
+		}
+	}
+
+	vc := metrics["VC"]
+	vi := metrics["VI"]
+	va := metrics["VA"]
+
+	if vc == "H" && vi == "H" && va == "H" {
+		return 9.3
+	} else if vc == "H" || vi == "H" || va == "H" {
+		return 7.5
+	} else if vc == "L" || vi == "L" || va == "L" {
+		return 5.3
+	}
+	return 6.0
+}
+
+// parseCVSSScore converts a numeric string, textual rating, or CVSS vector into a float64 score.
+func parseCVSSScore(scoreStr string) float64 {
+	scoreStr = strings.TrimSpace(scoreStr)
+	if scoreStr == "" {
+		return 0.0
+	}
+
+	if val, err := strconv.ParseFloat(scoreStr, 64); err == nil {
+		return val
+	}
+
+	switch strings.ToLower(scoreStr) {
+	case "critical":
+		return 9.5
+	case "high":
+		return 7.5
+	case "medium", "moderate":
+		return 5.5
+	case "low":
+		return 2.5
+	case "negligible", "untriaged", "informational":
+		return 0.1
+	}
+
+	if idx := strings.Index(scoreStr, "CVSS:3."); idx != -1 {
+		return calculateCVSSv3BaseScore(scoreStr[idx:])
+	}
+
+	if idx := strings.Index(scoreStr, "CVSS:4.0/"); idx != -1 {
+		return calculateCVSSv4BaseScore(scoreStr[idx:])
+	}
+
+	return 0.0
+}
+
+// extractHighestCVSSScore checks top-level severity, affected package severity, and database_specific entries.
+func extractHighestCVSSScore(v osvVuln) float64 {
+	var maxScore float64
+
+	for _, sev := range v.Severity {
+		if score := parseCVSSScore(sev.Score); score > maxScore {
+			maxScore = score
+		}
+	}
+
+	for _, aff := range v.Affected {
+		for _, sev := range aff.Severity {
+			if score := parseCVSSScore(sev.Score); score > maxScore {
+				maxScore = score
+			}
+		}
+	}
+
+	if v.DatabaseSpecific != nil {
+		if prio, ok := v.DatabaseSpecific["ubuntu_priority"].(string); ok {
+			if score := parseCVSSScore(prio); score > maxScore {
+				maxScore = score
+			}
+		}
+		if sevStr, ok := v.DatabaseSpecific["severity"].(string); ok {
+			if score := parseCVSSScore(sevStr); score > maxScore {
+				maxScore = score
+			}
+		}
+		if sevNum, ok := v.DatabaseSpecific["severity"].(float64); ok {
+			if sevNum > maxScore {
+				maxScore = sevNum
+			}
+		}
+	}
+
+	return maxScore
+}
+
+// fetchOSVVulnerabilityDetails retrieves full vulnerability payload by ID with rate-limit retry support.
+func fetchOSVVulnerabilityDetails(vulnID string) (osvVuln, error) {
+	vulnDetailsCacheMu.RLock()
+	if v, exists := vulnDetailsCache[vulnID]; exists {
+		vulnDetailsCacheMu.RUnlock()
+		return v, nil
+	}
+	vulnDetailsCacheMu.RUnlock()
+
+	endpoint := fmt.Sprintf("%s/v1/vulns/%s", activeOSVURL, vulnID)
+	maxRetries := 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*150) * time.Millisecond)
+		}
+
+		resp, err := osvHTTPClient.Get(endpoint)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			time.Sleep(time.Duration((attempt+1)*300) * time.Millisecond)
+			lastErr = fmt.Errorf("rate limited (429)")
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP status %d", resp.StatusCode)
+			continue
+		}
+
+		var v osvVuln
+		err = json.NewDecoder(resp.Body).Decode(&v)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		vulnDetailsCacheMu.Lock()
+		vulnDetailsCache[vulnID] = v
+		vulnDetailsCacheMu.Unlock()
+
+		return v, nil
+	}
+
+	return osvVuln{}, lastErr
+}
+
+// hydrateVulnerabilities fetches complete vulnerability details concurrently with rate limiting.
+func hydrateVulnerabilities(vulnIDs []string) {
+	uniqueIDs := make([]string, 0, len(vulnIDs))
+	seen := make(map[string]bool)
+
+	vulnDetailsCacheMu.RLock()
+	for _, id := range vulnIDs {
+		if !seen[id] {
+			seen[id] = true
+			if _, exists := vulnDetailsCache[id]; !exists {
+				uniqueIDs = append(uniqueIDs, id)
+			}
+		}
+	}
+	vulnDetailsCacheMu.RUnlock()
+
+	if len(uniqueIDs) == 0 {
+		return
+	}
+
+	log.Printf("Hydrating CVSS scores for %d unique vulnerabilities in background...", len(uniqueIDs))
+
+	jobs := make(chan string, len(uniqueIDs))
+	for _, id := range uniqueIDs {
+		jobs <- id
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	workers := 5
+	if len(uniqueIDs) < workers {
+		workers = len(uniqueIDs)
+	}
+
+	var successCount int64
+	var mu sync.Mutex
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range jobs {
+				time.Sleep(15 * time.Millisecond) // Throttle to prevent rate limits
+				_, err := fetchOSVVulnerabilityDetails(id)
+				if err == nil {
+					mu.Lock()
+					successCount++
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	log.Printf("Background hydration complete: successfully fetched %d/%d vulnerability details", successCount, len(uniqueIDs))
 }
 
 func main() {
@@ -338,7 +637,6 @@ func refreshCache(fetchOSV bool) {
 			continue
 		}
 
-		// Skip files that do not exist, cannot be read, or are 0 bytes (in-flight Ansible writes)
 		info, err := os.Stat(file)
 		if err != nil || info.Size() == 0 {
 			continue
@@ -367,8 +665,6 @@ func refreshCache(fetchOSV bool) {
 		}
 	}
 
-	// Only compute diffs if an initial baseline state already exists.
-	// This prevents daemon restarts from logging all existing packages as "ADDED".
 	if historyMgr != nil && len(previousState) > 0 {
 		diffs := ComputeDiffs(previousState, currentState)
 		if len(diffs) > 0 {
@@ -376,7 +672,6 @@ func refreshCache(fetchOSV bool) {
 		}
 	}
 
-	// Save current state as baseline for the next cycle
 	previousState = currentState
 
 	if activeOSVEnabled && len(allHosts) > 0 {
@@ -384,9 +679,7 @@ func refreshCache(fetchOSV bool) {
 			go func(h []HostPayload) {
 				isScanning = true
 				defer func() { isScanning = false }()
-				enrichWithOSV(h)
-				saveOSVCacheToDisk()
-				updatePayloadCache(h, newestTime)
+				enrichWithOSV(h, newestTime)
 			}(allHosts)
 		} else {
 			attachCachedOSV(allHosts)
@@ -434,7 +727,7 @@ func attachCachedOSV(hosts []HostPayload) {
 	}
 }
 
-func enrichWithOSV(hosts []HostPayload) {
+func enrichWithOSV(hosts []HostPayload, newestTime time.Time) {
 	uniquePkgs := make(map[pkgKey]bool)
 	for _, h := range hosts {
 		eco := determineEcosystem(h.OSName, h.OSVersion)
@@ -458,14 +751,20 @@ func enrichWithOSV(hosts []HostPayload) {
 
 	if len(toFetch) > 0 {
 		log.Printf("Querying OSV.dev API for %d packages (Cache TTL: %s)...", len(toFetch), activeOSVCacheTTL)
-		fetchOSVBatch(toFetch)
+		fetchOSVBatch(toFetch, hosts, newestTime)
+	} else {
+		attachCachedOSV(hosts)
+		updatePayloadCache(hosts, newestTime)
 	}
-
-	attachCachedOSV(hosts)
 }
 
-func fetchOSVBatch(pkgs []pkgKey) {
+func fetchOSVBatch(pkgs []pkgKey, hosts []HostPayload, newestTime time.Time) {
 	vulnCount := 0
+	var idsToHydrate []string
+
+	osvCacheMu.Lock()
+	now := time.Now()
+
 	for i := 0; i < len(pkgs); i += osvBatchSize {
 		end := i + osvBatchSize
 		if end > len(pkgs) {
@@ -510,8 +809,6 @@ func fetchOSVBatch(pkgs []pkgKey) {
 			continue
 		}
 
-		osvCacheMu.Lock()
-		now := time.Now()
 		for idx, res := range batchResp.Results {
 			if idx >= len(chunk) {
 				break
@@ -520,28 +817,16 @@ func fetchOSVBatch(pkgs []pkgKey) {
 			key := p.Name + "@" + p.Version + "@" + p.Ecosystem
 
 			var vulns []Vulnerability
-			for _, v := range res.Vulns {
-				var cves []string
-				for _, alias := range v.Aliases {
-					if strings.HasPrefix(alias, "CVE-") {
-						cves = append(cves, alias)
-					}
-				}
+			for _, minimalVuln := range res.Vulns {
+				idsToHydrate = append(idsToHydrate, minimalVuln.ID)
+				vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", minimalVuln.ID)
 
-				vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", v.ID)
-				for _, ref := range v.References {
-					if (ref.Type == "ADVISORY" || ref.Type == "WEB") && strings.HasPrefix(ref.URL, "http") {
-						vulnURL = ref.URL
-						break
-					}
-				}
-
+				// Initialize default fields so they exist in JSON immediately
 				vulns = append(vulns, Vulnerability{
-					ID:      v.ID,
-					CVE:     cves,
-					Summary: v.Summary,
-					Details: v.Details,
-					URL:     vulnURL,
+					ID:       minimalVuln.ID,
+					Details:  "",
+					URL:      vulnURL,
+					Severity: 0.0,
 				})
 			}
 
@@ -554,9 +839,57 @@ func fetchOSVBatch(pkgs []pkgKey) {
 				FetchedAt:       now,
 			}
 		}
-		osvCacheMu.Unlock()
 	}
-	log.Printf("OSV scan complete: found %d vulnerabilities across scanned packages", vulnCount)
+	osvCacheMu.Unlock()
+
+	// STEP 1: Immediately publish minimal data with default fields present in JSON
+	attachCachedOSV(hosts)
+	saveOSVCacheToDisk()
+	updatePayloadCache(hosts, newestTime)
+	log.Printf("OSV initial scan complete: found %d vulnerabilities. Published initial payload with default fields.", vulnCount)
+
+	if len(idsToHydrate) == 0 {
+		return
+	}
+
+	// STEP 2: Hydrate full details (CVSS scores) in the background
+	hydrateVulnerabilities(idsToHydrate)
+
+	// STEP 3: Enrich the cache entries with fetched CVSS scores and overwrite the payload/file
+	osvCacheMu.Lock()
+	for key, entry := range osvCache {
+		updated := false
+		for idx, v := range entry.Vulnerabilities {
+			vulnDetailsCacheMu.RLock()
+			hydrated, ok := vulnDetailsCache[v.ID]
+			vulnDetailsCacheMu.RUnlock()
+
+			if ok {
+				vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", hydrated.ID)
+				for _, ref := range hydrated.References {
+					if (ref.Type == "ADVISORY" || ref.Type == "WEB") && strings.HasPrefix(ref.URL, "http") {
+						vulnURL = ref.URL
+						break
+					}
+				}
+
+				entry.Vulnerabilities[idx].Details = hydrated.Details
+				entry.Vulnerabilities[idx].URL = vulnURL
+				entry.Vulnerabilities[idx].Severity = extractHighestCVSSScore(hydrated)
+				updated = true
+			}
+		}
+		if updated {
+			osvCache[key] = entry
+		}
+	}
+	osvCacheMu.Unlock()
+
+	// STEP 4: Overwrite payload cache and disk file with full severity ratings
+	attachCachedOSV(hosts)
+	saveOSVCacheToDisk()
+	updatePayloadCache(hosts, newestTime)
+	log.Printf("OSV severity enrichment complete: payload and cache updated with CVSS scores.")
 }
 
 func handlePackages(w http.ResponseWriter, r *http.Request) {
@@ -642,7 +975,6 @@ func ensureTLSCerts(certPath, keyPath string) error {
 	_ = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	_ = certOut.Close()
 
-	// Enforce strict 0600 permissions for private key
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
@@ -695,7 +1027,6 @@ func installSystemdService(port, dataPath, psk string, tlsEnabled, osvEnabled bo
 		}
 	}
 
-	// Save options securely into /etc/default/pkgdashd (0600 permissions)
 	envContent := fmt.Sprintf(`PKGDASH_PORT=%q
 PKGDASH_DATA_PATH=%q
 PKGDASH_PSK=%q
