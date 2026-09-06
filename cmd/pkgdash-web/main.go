@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"html/template"
 	"io"
@@ -22,11 +23,12 @@ import (
 )
 
 type Vulnerability struct {
-	ID      string   `json:"id"`
-	CVE     []string `json:"cve,omitempty"`
-	Summary string   `json:"summary,omitempty"`
-	Details string   `json:"details,omitempty"`
-	URL     string   `json:"url,omitempty"`
+	ID       string   `json:"id"`
+	CVE      []string `json:"cve,omitempty"`
+	Summary  string   `json:"summary,omitempty"`
+	Details  string   `json:"details,omitempty"`
+	URL      string   `json:"url,omitempty"`
+	Severity float64  `json:"severity,omitempty"`
 }
 
 type PackageInfo struct {
@@ -83,10 +85,27 @@ var (
 	pskConfig     string
 	webPort       string = ":8080"
 	hasOSVGlobal  bool
+	minSevConfig  float64 = 0.0
 )
 
 func main() {
-	serversConfig, pskConfig = getConfig()
+	flagMinSev := flag.Float64("min-severity", -1, "Minimum CVSS severity threshold to display vulnerabilities")
+	flagPort := flag.String("port", "", "Web server port")
+	flag.Parse()
+
+	serversConfig, pskConfig, minSevConfig = getConfig()
+
+	if *flagMinSev >= 0 {
+		minSevConfig = *flagMinSev
+	}
+	if *flagPort != "" {
+		if !strings.HasPrefix(*flagPort, ":") {
+			webPort = ":" + *flagPort
+		} else {
+			webPort = *flagPort
+		}
+	}
+
 	if len(serversConfig) == 0 {
 		log.Fatal("No servers found. Set PKGDASH_SERVERS or configure ~/.local/pkgdash.config")
 	}
@@ -114,13 +133,25 @@ func main() {
 	http.HandleFunc("/export/csv", handleExportCSV)
 	http.HandleFunc("/export/ini", handleExportINI)
 
-	fmt.Printf("🚀 Starting pkgdash-web on http://localhost%s\n", webPort)
+	minSevMsg := "all"
+	if minSevConfig > 0 {
+		minSevMsg = fmt.Sprintf(">= %.1f", minSevConfig)
+	}
+
+	fmt.Printf("🚀 Starting pkgdash-web on http://localhost%s (Min CVSS Severity: %s)\n", webPort, minSevMsg)
 	log.Fatal(http.ListenAndServe(webPort, nil))
 }
 
-func getConfig() ([]string, string) {
+func getConfig() ([]string, string, float64) {
 	var servers []string
 	psk := os.Getenv("PKGDASH_PSK")
+	minSev := 0.0
+
+	if envMinSev := os.Getenv("PKGDASH_MIN_SEVERITY"); envMinSev != "" {
+		if v, err := strconv.ParseFloat(envMinSev, 64); err == nil {
+			minSev = v
+		}
+	}
 
 	if envServers := os.Getenv("PKGDASH_SERVERS"); envServers != "" {
 		servers = strings.Split(envServers, ",")
@@ -149,6 +180,12 @@ func getConfig() ([]string, string) {
 					if psk == "" {
 						psk = line[4:]
 					}
+				} else if strings.HasPrefix(strings.ToLower(line), "min_severity=") {
+					if os.Getenv("PKGDASH_MIN_SEVERITY") == "" {
+						if v, err := strconv.ParseFloat(line[13:], 64); err == nil {
+							minSev = v
+						}
+					}
 				} else if strings.HasPrefix(strings.ToLower(line), "web_port=") {
 					portVal := line[9:]
 					if !strings.HasPrefix(portVal, ":") {
@@ -163,7 +200,7 @@ func getConfig() ([]string, string) {
 			_ = scanner.Err()
 		}
 	}
-	return servers, psk
+	return servers, psk, minSev
 }
 
 func fetchAllData(servers []string, psk string) {
@@ -242,6 +279,13 @@ func fetchAllData(servers []string, psk string) {
 					}
 
 					for _, pkg := range host.Packages {
+						var filteredVulns []Vulnerability
+						for _, v := range pkg.Vulnerabilities {
+							if minSevConfig <= 0 || v.Severity >= minSevConfig {
+								filteredVulns = append(filteredVulns, v)
+							}
+						}
+
 						localItems = append(localItems, FlatItem{
 							Hostname:        host.Hostname,
 							IPAddress:       host.IPAddress,
@@ -251,7 +295,7 @@ func fetchAllData(servers []string, psk string) {
 							PkgName:         pkg.Name,
 							Version:         pkg.Version,
 							Arch:            pkg.Arch,
-							Vulnerabilities: pkg.Vulnerabilities,
+							Vulnerabilities: filteredVulns,
 							OSVEnabled:      isOSV,
 						})
 					}
@@ -357,6 +401,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		"LastUpdated": lastUpdated.Local().Format("15:04:05"),
 		"SecStatus":   secStatus,
 		"HasOSV":      hasOSV,
+		"MinSev":      minSevConfig,
 	})
 }
 
@@ -515,6 +560,10 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 	dataMutex.RUnlock()
 
 	vulnSummary := "None detected"
+	if minSevConfig > 0 {
+		vulnSummary = fmt.Sprintf("None detected >= %.1f", minSevConfig)
+	}
+
 	if len(host.Vulnerabilities) > 0 {
 		var ids []string
 		for _, v := range host.Vulnerabilities {
@@ -755,6 +804,26 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 		}
 		return " (" + strings.Join(cves, ", ") + ")"
 	},
+	"sevClass": func(sev float64) string {
+		switch {
+		case sev >= 9.0:
+			return "sev-critical"
+		case sev >= 7.0:
+			return "sev-high"
+		case sev >= 4.0:
+			return "sev-medium"
+		case sev > 0.0:
+			return "sev-low"
+		default:
+			return "sev-unknown"
+		}
+	},
+	"formatSev": func(sev float64) string {
+		if sev <= 0 {
+			return "N/A"
+		}
+		return fmt.Sprintf("%.1f", sev)
+	},
 }).Parse(`
 {{define "index"}}
 <!DOCTYPE html>
@@ -798,6 +867,19 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         .bg-green { background: var(--green); } 
         .bg-yellow { background: var(--yellow); } 
         .bg-red { background: var(--red); color: white; }
+
+        .sev-badge {
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 11px;
+            display: inline-block;
+        }
+        .sev-critical { background: #FF5555; color: #FFFFFF; font-weight: bold; }
+        .sev-high     { background: #FFB86C; color: #11111B; font-weight: bold; }
+        .sev-medium   { background: #F1FA8C; color: #11111B; }
+        .sev-low      { background: #50FA7B; color: #11111B; }
+        .sev-unknown  { background: #6C7086; color: #CDD6F4; }
 
         .flex { display: flex; gap: 1rem; flex-shrink: 0; }
         .filter-card { flex: 1; border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; transition: border 0.2s; }
@@ -882,7 +964,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         <div>
             <span class="badge bg-purple"> 📦 PKGDASH-WEB </span>
             <span class="badge bg-cyan"> {{.SecStatus}} </span>
-            {{if .HasOSV}}<span class="badge bg-red">🛡 OSV</span>{{end}}
+            {{if .HasOSV}}<span class="badge bg-red">🛡 OSV{{if gt .MinSev 0.0}} (≥{{.MinSev}}){{end}}</span>{{end}}
             <span class="badge bg-green"> ✓ SYNCED </span>
         </div>
         <div class="text-muted" style="font-style: italic;">
@@ -1040,10 +1122,9 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             });
         });
 
-        // Modal Close on click outside (Fixed buggy boundingrect check)
+        // Modal Close on click outside
         document.querySelectorAll('dialog').forEach(dialog => {
             dialog.addEventListener('click', (e) => {
-                // native behavior: backdrop is part of dialog, content is children
                 if (e.target === dialog) {
                     dialog.close();
                 }
@@ -1138,9 +1219,15 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <div style="max-height: 450px; overflow-y: auto; padding-right: 0.5rem;">
         {{range .Vulnerabilities}}
         <div class="osv-item">
-            <div><span class="text-pink" style="font-weight:bold;">ID/CVE:</span> <span class="text-red">{{.ID}}{{joinCVE .CVE}}</span></div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
+                <div><span class="text-pink" style="font-weight:bold;">ID/CVE:</span> <span class="text-red">{{.ID}}{{joinCVE .CVE}}</span></div>
+                <div><span class="sev-badge {{sevClass .Severity}}">CVSS {{formatSev .Severity}}</span></div>
+            </div>
             {{if .Summary}}
             <div style="margin-top:0.3rem;"><span class="text-pink" style="font-weight:bold;">Summary:</span> {{.Summary}}</div>
+            {{end}}
+            {{if .Details}}
+            <div style="margin-top:0.3rem; font-size: 13px; line-height: 1.4;"><span class="text-pink" style="font-weight:bold;">Details:</span> {{.Details}}</div>
             {{end}}
             {{if .URL}}
             <div style="margin-top:0.3rem;"><span class="text-pink" style="font-weight:bold;">Link:</span> <a href="{{cleanURL .URL}}" target="_blank" rel="noopener noreferrer" class="osv-link">{{cleanURL .URL}}</a></div>
