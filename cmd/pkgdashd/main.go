@@ -635,14 +635,15 @@ func ensureTLSCerts(certPath, keyPath string) error {
 		return err
 	}
 
-	certOut, err := os.Create(certPath)
+	certOut, err := os.OpenFile(certPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
 	_ = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	_ = certOut.Close()
 
-	keyOut, err := os.Create(keyPath)
+	// Enforce strict 0600 permissions for private key
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
