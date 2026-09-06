@@ -19,3 +19,6 @@ services:
 
       # Optional: Container timezone configuration
       - TZ=Europe/Amsterdam
+
+      # Optional: Minimal severity
+      - PKGDASH_MIN_SEVERITY=7.0
