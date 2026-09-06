@@ -308,10 +308,12 @@ func parseCVSSScore(scoreStr string) float64 {
 	return 0.0
 }
 
-// extractHighestCVSSScore checks top-level severity, affected package severity, and database_specific entries.
+// extractHighestCVSSScore checks explicit CVSS vectors first.
+// Textual vendor priorities in database_specific are only used as fallback if no vector exists.
 func extractHighestCVSSScore(v osvVuln) float64 {
 	var maxScore float64
 
+	// 1. First scan explicit CVSS vectors (top-level and affected)
 	for _, sev := range v.Severity {
 		if score := parseCVSSScore(sev.Score); score > maxScore {
 			maxScore = score
@@ -326,21 +328,14 @@ func extractHighestCVSSScore(v osvVuln) float64 {
 		}
 	}
 
-	if v.DatabaseSpecific != nil {
+	// 2. Only fall back to database_specific ratings if no explicit CVSS vector was found
+	if maxScore == 0.0 && v.DatabaseSpecific != nil {
 		if prio, ok := v.DatabaseSpecific["ubuntu_priority"].(string); ok {
-			if score := parseCVSSScore(prio); score > maxScore {
-				maxScore = score
-			}
-		}
-		if sevStr, ok := v.DatabaseSpecific["severity"].(string); ok {
-			if score := parseCVSSScore(sevStr); score > maxScore {
-				maxScore = score
-			}
-		}
-		if sevNum, ok := v.DatabaseSpecific["severity"].(float64); ok {
-			if sevNum > maxScore {
-				maxScore = sevNum
-			}
+			maxScore = parseCVSSScore(prio)
+		} else if sevStr, ok := v.DatabaseSpecific["severity"].(string); ok {
+			maxScore = parseCVSSScore(sevStr)
+		} else if sevNum, ok := v.DatabaseSpecific["severity"].(float64); ok {
+			maxScore = sevNum
 		}
 	}
 
