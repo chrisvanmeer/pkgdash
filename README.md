@@ -168,9 +168,14 @@ You can run `pkgdash-web` directly as a standalone binary, via Docker, or orches
 ```bash
 export PKGDASH_SERVERS="https://pkgdash.internal.domain:9876"
 export PKGDASH_PSK="your-secret-key"
-export PKGDASH_WEB_PORT=":8080" # Optional, defaults to :8080
+export PKGDASH_WEB_PORT=":8080"      # Optional, defaults to :8080
+export PKGDASH_MIN_SEVERITY="7.0"    # Optional, minimum CVSS score to display
 
+# Run directly
 ./pkgdash-web
+
+# Or use CLI flags (overrides environment variables)
+./pkgdash-web -port 8080 -min-severity 7.0
 ```
 
 You can also define `web_port=8080` in `~/.local/pkgdash.config`.

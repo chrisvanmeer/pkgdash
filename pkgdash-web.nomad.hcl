@@ -73,9 +73,10 @@ job "pkgdash-web" {
 
       # --- Option A: Static Environment Variables + Nomad Variables (Default) ---
       env {
-        PKGDASH_WEB_PORT = ":8080"
-        TZ               = "Europe/Amsterdam"
-        PKGDASH_SERVERS  = "https://pkgdashd.internal.domain:9876"
+        PKGDASH_WEB_PORT     = ":8080"
+        TZ                   = "Europe/Amsterdam"
+        PKGDASH_SERVERS      = "https://pkgdashd.internal.domain:9876"
+        PKGDASH_MIN_SEVERITY = "7.0"
       }
 
       template {
@@ -102,6 +103,7 @@ EOH
       # TZ="{{ .Data.data.TZ }}"
       # PKGDASH_SERVERS="{{ .Data.data.PKGDASH_SERVERS }}"
       # PKGDASH_PSK="{{ .Data.data.PKGDASH_PSK }}"
+      # PKGDASH_MIN_SEVERITY="{{ .Data.data.PKGDASH_MIN_SEVERITY }}"
       # {{- end -}}
       # EOH
       #   destination = "secrets/env"
