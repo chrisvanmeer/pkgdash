@@ -95,6 +95,34 @@ sudo ./pkgdashd --uninstall
 * `--osv-proxy`: Optional HTTP/HTTPS proxy URL for OSV requests.
 * `--osv-cache-ttl`: OSV cache TTL duration (e.g., `6h`, `12h`, `24h`, default `12h`).
 
+### Environment Variables & Secure Systemd Configuration
+
+`pkgdashd` reads configuration values from environment variables or command-line flags. Command-line flags take precedence over environment variables.
+
+When installing as a systemd service (`--install`), options (including sensitive keys like `--psk`) are saved securely to `/etc/default/pkgdashd` with `0600` permissions and loaded via `EnvironmentFile=-/etc/default/pkgdashd`. This prevents credentials from showing up in `ps aux` or `systemctl status`.
+
+| Environment Variable    | Equivalent Flag   | Default               |
+| :---------------------- | :---------------- | :-------------------- |
+| `PKGDASH_PORT`          | `--port`          | `:9876`               |
+| `PKGDASH_DATA_PATH`     | `--data-path`     | `/tmp/pkgdash`        |
+| `PKGDASH_PSK`           | `--psk`           | `""`                  |
+| `PKGDASH_TLS`           | `--tls`           | `false`               |
+| `PKGDASH_ENABLE_OSV`    | `--enable-osv`    | `false`               |
+| `PKGDASH_OSV_URL`       | `--osv-url`       | `https://api.osv.dev` |
+| `PKGDASH_OSV_PROXY`     | `--osv-proxy`     | `""`                  |
+| `PKGDASH_OSV_CACHE_TTL` | `--osv-cache-ttl` | `12h`                 |
+
+#### Example `/etc/default/pkgdashd` File
+
+```env
+PKGDASH_PORT=":9876"
+PKGDASH_DATA_PATH="/var/lib/pkgdash_data"
+PKGDASH_PSK="super-secret-key"
+PKGDASH_TLS="true"
+PKGDASH_ENABLE_OSV="true"
+PKGDASH_OSV_CACHE_TTL="12h"
+```
+
 ---
 
 ### 2. Running the TUI Client (`pkgdash`)

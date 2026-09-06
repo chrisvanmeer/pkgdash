@@ -33,6 +33,7 @@ const (
 	defaultOSVProxy    = ""
 	defaultOSVCacheTTL = 12 * time.Hour
 	serviceName        = "pkgdashd"
+	envFilePath        = "/etc/default/pkgdashd"
 	installDir         = "/usr/local/bin"
 	osvHTTPTimeout     = 30 * time.Second
 	osvBatchSize       = 100
@@ -136,18 +137,42 @@ type osvReference struct {
 	URL  string `json:"url"`
 }
 
+func getEnvOrDefault(key, defaultValue string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultValue
+}
+
+func getEnvBoolOrDefault(key string, defaultValue bool) bool {
+	if val := os.Getenv(key); val != "" {
+		return strings.ToLower(val) == "true" || val == "1"
+	}
+	return defaultValue
+}
+
+func getEnvDurationOrDefault(key string, defaultValue time.Duration) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			return d
+		}
+	}
+	return defaultValue
+}
+
 func main() {
 	installFlag := flag.Bool("install", false, "Install binary to /usr/local/bin and enable systemd service")
 	uninstallFlag := flag.Bool("uninstall", false, "Stop, disable, and remove the systemd service and binary")
-	portFlag := flag.String("port", defaultPort, "Port to listen on")
-	dataPathFlag := flag.String("data-path", defaultDataPath, "Path to the directory containing JSON files")
-	pskFlag := flag.String("psk", "", "Pre-shared key for authentication (optional)")
-	tlsFlag := flag.Bool("tls", false, "Enable TLS encryption (auto-generates certificates)")
 
-	osvEnableFlag := flag.Bool("enable-osv", defaultOSVEnable, "Enable OSV.dev vulnerability checking")
-	osvURLFlag := flag.String("osv-url", defaultOSVURL, "OSV API URL (or internal mirror)")
-	osvProxyFlag := flag.String("osv-proxy", defaultOSVProxy, "Proxy URL for OSV requests")
-	osvCacheTTLFlag := flag.Duration("osv-cache-ttl", defaultOSVCacheTTL, "OSV cache TTL duration (e.g. 6h, 12h, 24h)")
+	portFlag := flag.String("port", getEnvOrDefault("PKGDASH_PORT", defaultPort), "Port to listen on")
+	dataPathFlag := flag.String("data-path", getEnvOrDefault("PKGDASH_DATA_PATH", defaultDataPath), "Path to directory containing JSON files")
+	pskFlag := flag.String("psk", getEnvOrDefault("PKGDASH_PSK", ""), "Pre-shared key for authentication")
+	tlsFlag := flag.Bool("tls", getEnvBoolOrDefault("PKGDASH_TLS", false), "Enable TLS encryption")
+
+	osvEnableFlag := flag.Bool("enable-osv", getEnvBoolOrDefault("PKGDASH_ENABLE_OSV", defaultOSVEnable), "Enable OSV.dev vulnerability checking")
+	osvURLFlag := flag.String("osv-url", getEnvOrDefault("PKGDASH_OSV_URL", defaultOSVURL), "OSV API URL")
+	osvProxyFlag := flag.String("osv-proxy", getEnvOrDefault("PKGDASH_OSV_PROXY", defaultOSVProxy), "Proxy URL for OSV requests")
+	osvCacheTTLFlag := flag.Duration("osv-cache-ttl", getEnvDurationOrDefault("PKGDASH_OSV_CACHE_TTL", defaultOSVCacheTTL), "OSV cache TTL duration")
 
 	flag.Parse()
 
@@ -166,7 +191,7 @@ func main() {
 		if err := installSystemdService(*portFlag, *dataPathFlag, *pskFlag, *tlsFlag, activeOSVEnabled, activeOSVURL, activeOSVProxy, activeOSVCacheTTL); err != nil {
 			log.Fatalf("Failed to install systemd service: %v", err)
 		}
-		fmt.Printf("Systemd service installed successfully.\nListening on %s | Reading from %s\n", *portFlag, *dataPathFlag)
+		fmt.Printf("Systemd service installed successfully.\nConfiguration written to %s (0600)\nListening on %s | Reading from %s\n", envFilePath, *portFlag, *dataPathFlag)
 		return
 	}
 
@@ -669,24 +694,19 @@ func installSystemdService(port, dataPath, psk string, tlsEnabled, osvEnabled bo
 		}
 	}
 
-	execCmd := fmt.Sprintf("%s --port=%q --data-path=%q", targetPath, port, dataPath)
-	if psk != "" {
-		execCmd += fmt.Sprintf(" --psk=%q", psk)
-	}
-	if tlsEnabled {
-		execCmd += " --tls"
-	}
-	if osvEnabled {
-		execCmd += " --enable-osv"
-		if osvURL != "" && osvURL != defaultOSVURL {
-			execCmd += fmt.Sprintf(" --osv-url=%q", osvURL)
-		}
-		if osvProxy != "" {
-			execCmd += fmt.Sprintf(" --osv-proxy=%q", osvProxy)
-		}
-		if osvCacheTTL != defaultOSVCacheTTL {
-			execCmd += fmt.Sprintf(" --osv-cache-ttl=%q", osvCacheTTL.String())
-		}
+	// Save options securely into /etc/default/pkgdashd (0600 permissions)
+	envContent := fmt.Sprintf(`PKGDASH_PORT=%q
+PKGDASH_DATA_PATH=%q
+PKGDASH_PSK=%q
+PKGDASH_TLS="%t"
+PKGDASH_ENABLE_OSV="%t"
+PKGDASH_OSV_URL=%q
+PKGDASH_OSV_PROXY=%q
+PKGDASH_OSV_CACHE_TTL=%q
+`, port, dataPath, psk, tlsEnabled, osvEnabled, osvURL, osvProxy, osvCacheTTL.String())
+
+	if err := os.WriteFile(envFilePath, []byte(envContent), 0600); err != nil {
+		return fmt.Errorf("failed to write environment file %s: %w", envFilePath, err)
 	}
 
 	unitContent := fmt.Sprintf(`[Unit]
@@ -695,13 +715,14 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=-%s
 ExecStart=%s
 Restart=always
 User=root
 
 [Install]
 WantedBy=multi-user.target
-`, execCmd)
+`, envFilePath, targetPath)
 
 	unitPath := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
 	if err := os.WriteFile(unitPath, []byte(unitContent), 0644); err != nil {
@@ -725,6 +746,7 @@ func uninstallSystemdService() error {
 	_ = exec.Command("systemctl", "stop", serviceName).Run()
 	_ = exec.Command("systemctl", "disable", serviceName).Run()
 	_ = os.Remove(fmt.Sprintf("/etc/systemd/system/%s.service", serviceName))
+	_ = os.Remove(envFilePath)
 	_ = exec.Command("systemctl", "daemon-reload").Run()
 	_ = os.Remove(filepath.Join(installDir, serviceName))
 	return nil
