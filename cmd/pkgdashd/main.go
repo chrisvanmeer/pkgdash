@@ -312,15 +312,23 @@ func refreshCache(fetchOSV bool) {
 		if strings.HasSuffix(file, "history.json") || strings.HasSuffix(file, "history.jsonl") || strings.HasSuffix(file, "osv_cache.json") {
 			continue
 		}
-		if info, err := os.Stat(file); err == nil && info.ModTime().After(newestTime) {
+
+		// Skip files that do not exist, cannot be read, or are 0 bytes (in-flight Ansible writes)
+		info, err := os.Stat(file)
+		if err != nil || info.Size() == 0 {
+			continue
+		}
+		if info.ModTime().After(newestTime) {
 			newestTime = info.ModTime()
 		}
+
 		data, err := os.ReadFile(file)
 		if err != nil {
 			continue
 		}
+
 		var hosts []HostPayload
-		if err := json.Unmarshal(data, &hosts); err == nil {
+		if err := json.Unmarshal(data, &hosts); err == nil && len(hosts) > 0 {
 			for i := range hosts {
 				hosts[i].OSVEnabled = activeOSVEnabled
 				if currentState[hosts[i].Hostname] == nil {
@@ -334,12 +342,16 @@ func refreshCache(fetchOSV bool) {
 		}
 	}
 
-	if historyMgr != nil {
+	// Only compute diffs if an initial baseline state already exists.
+	// This prevents daemon restarts from logging all existing packages as "ADDED".
+	if historyMgr != nil && len(previousState) > 0 {
 		diffs := ComputeDiffs(previousState, currentState)
 		if len(diffs) > 0 {
 			historyMgr.RecordChanges(diffs)
 		}
 	}
+
+	// Save current state as baseline for the next cycle
 	previousState = currentState
 
 	if activeOSVEnabled && len(allHosts) > 0 {
