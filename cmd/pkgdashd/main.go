@@ -309,26 +309,56 @@ func parseCVSSScore(scoreStr string) float64 {
 }
 
 // extractHighestCVSSScore checks explicit CVSS vectors first.
-// Textual vendor priorities in database_specific are only used as fallback if no vector exists.
+// Textual vendor ratings (like type "Ubuntu" with score "medium") are only used as fallback if no CVSS vector exists.
 func extractHighestCVSSScore(v osvVuln) float64 {
 	var maxScore float64
 
-	// 1. First scan explicit CVSS vectors (top-level and affected)
-	for _, sev := range v.Severity {
-		if score := parseCVSSScore(sev.Score); score > maxScore {
-			maxScore = score
-		}
+	isCVSS := func(sev osvSeverity) bool {
+		t := strings.ToUpper(sev.Type)
+		s := strings.TrimSpace(sev.Score)
+		return strings.HasPrefix(t, "CVSS") || strings.HasPrefix(s, "CVSS:")
 	}
 
-	for _, aff := range v.Affected {
-		for _, sev := range aff.Severity {
+	// 1. First pass: look ONLY for explicit CVSS vectors/scores
+	for _, sev := range v.Severity {
+		if isCVSS(sev) {
 			if score := parseCVSSScore(sev.Score); score > maxScore {
 				maxScore = score
 			}
 		}
 	}
 
-	// 2. Only fall back to database_specific ratings if no explicit CVSS vector was found
+	for _, aff := range v.Affected {
+		for _, sev := range aff.Severity {
+			if isCVSS(sev) {
+				if score := parseCVSSScore(sev.Score); score > maxScore {
+					maxScore = score
+				}
+			}
+		}
+	}
+
+	// 2. Second pass: fallback to textual ratings (type "Ubuntu", etc.) if no CVSS vector was found
+	if maxScore == 0.0 {
+		for _, sev := range v.Severity {
+			if !isCVSS(sev) {
+				if score := parseCVSSScore(sev.Score); score > maxScore {
+					maxScore = score
+				}
+			}
+		}
+		for _, aff := range v.Affected {
+			for _, sev := range aff.Severity {
+				if !isCVSS(sev) {
+					if score := parseCVSSScore(sev.Score); score > maxScore {
+						maxScore = score
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Third pass: fallback to database_specific ratings if still no score found
 	if maxScore == 0.0 && v.DatabaseSpecific != nil {
 		if prio, ok := v.DatabaseSpecific["ubuntu_priority"].(string); ok {
 			maxScore = parseCVSSScore(prio)
