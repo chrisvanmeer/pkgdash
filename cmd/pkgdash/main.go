@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,11 +35,12 @@ const (
 )
 
 type Vulnerability struct {
-	ID      string   `json:"id"`
-	CVE     []string `json:"cve,omitempty"`
-	Summary string   `json:"summary,omitempty"`
-	Details string   `json:"details,omitempty"`
-	URL     string   `json:"url,omitempty"`
+	ID       string   `json:"id"`
+	CVE      []string `json:"cve,omitempty"`
+	Summary  string   `json:"summary,omitempty"`
+	Details  string   `json:"details,omitempty"`
+	URL      string   `json:"url,omitempty"`
+	Severity float64  `json:"severity,omitempty"`
 }
 
 type PackageInfo struct {
@@ -166,6 +169,13 @@ var (
 				Padding(0, 1).
 				Bold(true)
 
+	// Severity badges for CVSS
+	sevCriticalStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(cRed).Bold(true).Padding(0, 1)
+	sevHighStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#11111B")).Background(lipgloss.Color("#FFB86C")).Bold(true).Padding(0, 1)
+	sevMediumStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#11111B")).Background(cYellow).Bold(true).Padding(0, 1)
+	sevLowStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#11111B")).Background(cGreen).Bold(true).Padding(0, 1)
+	sevUnknownStyle  = lipgloss.NewStyle().Foreground(cText).Background(cMuted).Padding(0, 1)
+
 	metaStyle = lipgloss.NewStyle().
 			Foreground(cMuted).
 			Italic(true)
@@ -234,6 +244,23 @@ var (
 			Align(lipgloss.Center)
 )
 
+func renderSevBadge(sev float64) string {
+	if sev <= 0 {
+		return sevUnknownStyle.Render("CVSS N/A")
+	}
+	scoreStr := fmt.Sprintf("CVSS %.1f", sev)
+	switch {
+	case sev >= 9.0:
+		return sevCriticalStyle.Render(scoreStr)
+	case sev >= 7.0:
+		return sevHighStyle.Render(scoreStr)
+	case sev >= 4.0:
+		return sevMediumStyle.Render(scoreStr)
+	default:
+		return sevLowStyle.Render(scoreStr)
+	}
+}
+
 type dataMsg struct {
 	items     []FlatItem
 	timestamp time.Time
@@ -250,6 +277,7 @@ type historyDataMsg struct {
 type model struct {
 	servers []string
 	psk     string
+	minSev  float64
 
 	hostInput    textinput.Model
 	pkgInput     textinput.Model
@@ -329,7 +357,14 @@ type model struct {
 }
 
 func main() {
-	servers, psk := getConfig()
+	flagMinSev := flag.Float64("min-severity", -1, "Minimum CVSS severity threshold to display vulnerabilities")
+	flag.Parse()
+
+	servers, psk, minSev := getConfig()
+	if *flagMinSev >= 0 {
+		minSev = *flagMinSev
+	}
+
 	if len(servers) == 0 {
 		log.Fatal("No servers found. Set PKGDASH_SERVERS or configure ~/.local/pkgdash.config")
 	}
@@ -372,6 +407,7 @@ func main() {
 	m := model{
 		servers:         servers,
 		psk:             psk,
+		minSev:          minSev,
 		hostInput:       hi,
 		pkgInput:        pi,
 		verInput:        vi,
@@ -393,7 +429,7 @@ func main() {
 		showOnlyVulns:   false,
 	}
 
-	go fetchAllDataAsync(servers, psk, updateChan)
+	go fetchAllDataAsync(servers, psk, minSev, updateChan)
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
@@ -401,9 +437,16 @@ func main() {
 	}
 }
 
-func getConfig() ([]string, string) {
+func getConfig() ([]string, string, float64) {
 	var servers []string
 	psk := os.Getenv("PKGDASH_PSK")
+	minSev := 0.0
+
+	if envMinSev := os.Getenv("PKGDASH_MIN_SEVERITY"); envMinSev != "" {
+		if v, err := strconv.ParseFloat(envMinSev, 64); err == nil {
+			minSev = v
+		}
+	}
 
 	if envServers := os.Getenv("PKGDASH_SERVERS"); envServers != "" {
 		servers = strings.Split(envServers, ",")
@@ -425,6 +468,12 @@ func getConfig() ([]string, string) {
 					if psk == "" {
 						psk = line[4:]
 					}
+				} else if strings.HasPrefix(strings.ToLower(line), "min_severity=") {
+					if os.Getenv("PKGDASH_MIN_SEVERITY") == "" {
+						if v, err := strconv.ParseFloat(line[13:], 64); err == nil {
+							minSev = v
+						}
+					}
 				} else if len(servers) == 0 {
 					servers = append(servers, line)
 				}
@@ -432,10 +481,10 @@ func getConfig() ([]string, string) {
 			_ = scanner.Err()
 		}
 	}
-	return servers, psk
+	return servers, psk, minSev
 }
 
-func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
+func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan chan dataMsg) {
 	var wg sync.WaitGroup
 
 	customTransport := &http.Transport{
@@ -514,6 +563,13 @@ func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
 
 				var localItems []FlatItem
 				for _, pkg := range host.Packages {
+					var filteredVulns []Vulnerability
+					for _, v := range pkg.Vulnerabilities {
+						if minSev <= 0 || v.Severity >= minSev {
+							filteredVulns = append(filteredVulns, v)
+						}
+					}
+
 					localItems = append(localItems, FlatItem{
 						Hostname:        host.Hostname,
 						IPAddress:       host.IPAddress,
@@ -523,7 +579,7 @@ func fetchAllDataAsync(servers []string, psk string, updateChan chan dataMsg) {
 						PkgName:         pkg.Name,
 						Version:         pkg.Version,
 						Arch:            pkg.Arch,
-						Vulnerabilities: pkg.Vulnerabilities,
+						Vulnerabilities: filteredVulns,
 						OSVEnabled:      isOSV,
 					})
 				}
@@ -1705,10 +1761,14 @@ func (m model) View() string {
 			}
 
 			cleanURL := strings.Replace(v.URL, "https://osv.dev/vulnerabilities/", "https://osv.dev/vulnerability/", 1)
+			sevBadgeStr := renderSevBadge(v.Severity)
 
-			detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render(prefix+"ID/CVE:  "), lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(cveStr)))
+			detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render(prefix+"ID/CVE:  "), lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(cveStr), "  ", sevBadgeStr))
 			if v.Summary != "" {
 				detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("  Summary: "), valStyle.Render(truncate(v.Summary, modalContentWidth-12))))
+			}
+			if v.Details != "" {
+				detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("  Details: "), valStyle.Render(truncate(v.Details, modalContentWidth-12))))
 			}
 			if cleanURL != "" {
 				detailLines = append(detailLines, lipgloss.JoinHorizontal(lipgloss.Left, lblStyle.Render("  Link:    "), lipgloss.NewStyle().Foreground(cCyan).Underline(true).Render(truncate(cleanURL, modalContentWidth-12))))
@@ -1972,6 +2032,10 @@ func (m model) View() string {
 		var bodyContent string
 		if m.hostModalTab == 0 {
 			vulnSummary := "None detected"
+			if m.minSev > 0 {
+				vulnSummary = fmt.Sprintf("None detected >= %.1f", m.minSev)
+			}
+
 			if len(m.selectedHost.Vulnerabilities) > 0 {
 				var ids []string
 				for _, v := range m.selectedHost.Vulnerabilities {
@@ -2106,7 +2170,7 @@ func (m model) View() string {
 		matchesB := m.getMatchedHosts(m.diffHostBInput.Value(), m.resolveHost(m.diffHostAInput.Value()))
 
 		form := lipgloss.JoinVertical(lipgloss.Left,
-			lipgloss.JoinHorizontal(lipgloss.Left, labelAStyle.Render("Host A (Base):   "), m.diffHostAInput.View()),
+			lipgloss.JoinHorizontal(lipgloss.Left, labelAStyle.Render("Host A (Base):    "), m.diffHostAInput.View()),
 			formatSuggestions(matchesA),
 			"",
 			lipgloss.JoinHorizontal(lipgloss.Left, labelBStyle.Render("Host B (Target): "), m.diffHostBInput.View()),
@@ -2292,7 +2356,11 @@ func (m model) View() string {
 
 	var osvBadgeStr string
 	if m.hasOSV {
-		osvBadgeStr = osvBadgeStyle.Render("🛡 OSV")
+		if m.minSev > 0 {
+			osvBadgeStr = osvBadgeStyle.Render(fmt.Sprintf("🛡 OSV (≥%.1f)", m.minSev))
+		} else {
+			osvBadgeStr = osvBadgeStyle.Render("🛡 OSV")
+		}
 	}
 
 	var stBadge string
