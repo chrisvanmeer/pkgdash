@@ -298,6 +298,7 @@ type model struct {
 	visibleLines  int
 	showOnlyVulns bool
 
+	showHelpModal  bool
 	showAboutModal bool
 	showHostModal  bool
 	selectedHost   FlatItem
@@ -419,6 +420,7 @@ func main() {
 		sortDesc:        false,
 		offset:          0,
 		cursor:          0,
+		showHelpModal:   false,
 		showAboutModal:  false,
 		showHostModal:   false,
 		loaded:          false,
@@ -1087,6 +1089,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// 0. Keyboard Shortcuts Help Modal
+	if m.showHelpModal {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc", "enter", "ctrl+c", "f1", "q":
+				m.showHelpModal = false
+				return m, nil
+			}
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
+		}
+		return m, nil
+	}
+
 	// 1. OSV Vulnerability Detail Modal
 	if m.showOSVModal {
 		switch msg := msg.(type) {
@@ -1258,7 +1276,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// 5. Diff Host Selection Modal
+	// 5. Diff Selection Modal
 	if m.showDiffSelectModal {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1403,6 +1421,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
+		case "f1":
+			m.showHelpModal = true
+			return m, nil
+
 		case "esc":
 			return m, tea.Quit
 		case "ctrl+u":
@@ -1713,6 +1735,83 @@ func truncate(str string, maxLen int) string {
 func (m model) View() string {
 	if !m.ready {
 		return "Initializing Dashboard..."
+	}
+
+	// 0. Keyboard Shortcuts Help Modal
+	if m.showHelpModal {
+		modalWidth := 74
+		if m.width-12 < modalWidth {
+			modalWidth = m.width - 12
+		}
+		if modalWidth < 52 {
+			modalWidth = 52
+		}
+
+		titleBar := titleBadge.Render(" ⌨️ KEYBOARD SHORTCUTS ")
+
+		colKeyW := 22
+		colDescW := modalWidth - colKeyW - 4
+
+		hdrKey := tableHeaderStyle.Width(colKeyW).MaxWidth(colKeyW).Render(" SHORTCUT")
+		hdrDesc := tableHeaderStyle.Width(colDescW).MaxWidth(colDescW).Render(" ACTION / DESCRIPTION")
+		tableHdr := lipgloss.JoinHorizontal(lipgloss.Left, hdrKey, hdrDesc)
+
+		type shortcutItem struct {
+			key   string
+			desc  string
+			isCat bool
+		}
+
+		shortcuts := []shortcutItem{
+			{key: "NAVIGATION & SORTING", isCat: true},
+			{key: "Tab / Shift+Tab", desc: "Switch search input field"},
+			{key: "▲ / ▼  (Ctrl+K/J)", desc: "Navigate table rows"},
+			{key: "PgUp / PgDown", desc: "Scroll full page"},
+			{key: "Ctrl+H / P / V", desc: "Sort by Host / Package / Version"},
+
+			{key: "VIEWS & MODALS", isCat: true},
+			{key: "Enter", desc: "Open Host overview & change history"},
+			{key: "Ctrl+O", desc: "Open OSV Security Advisory"},
+			{key: "Ctrl+Y", desc: "Open Fleet Audit Log (Timeline)"},
+			{key: "Ctrl+D", desc: "Compare host packages (Diff tool)"},
+			{key: "Ctrl+C", desc: "About Pkgdash Control Center"},
+
+			{key: "FILTERS & EXPORT", isCat: true},
+			{key: "Ctrl+U", desc: "Toggle Vulnerable-only filter"},
+			{key: "Ctrl+S", desc: "Export search results to CSV"},
+			{key: "Ctrl+E", desc: "Export host list to Ansible INI"},
+			{key: "F1", desc: "Show this shortcuts menu"},
+			{key: "Esc", desc: "Close modal / Quit application"},
+		}
+
+		var lines []string
+		lines = append(lines, tableHdr)
+
+		for _, s := range shortcuts {
+			if s.isCat {
+				catStr := lipgloss.NewStyle().Foreground(cPink).Bold(true).Render(" ❯ " + s.key)
+				lines = append(lines, catStr)
+			} else {
+				kStr := lipgloss.NewStyle().Foreground(cCyan).Bold(true).Width(colKeyW).MaxWidth(colKeyW).Render(" " + s.key)
+				dStr := rowStyleNormal.Width(colDescW).MaxWidth(colDescW).Render(s.desc)
+				lines = append(lines, lipgloss.JoinHorizontal(lipgloss.Left, kStr, dStr))
+			}
+		}
+
+		body := strings.Join(lines, "\n")
+		frame := panelStyle.BorderForeground(cPurple).Width(modalWidth + 2).Render(body)
+		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[Press Esc / Enter / F1 to close]")
+
+		content := lipgloss.JoinVertical(lipgloss.Center,
+			titleBar,
+			"",
+			frame,
+			"",
+			helpText,
+		)
+
+		dialog := modalStyle.Render(content)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
 
 	// 1. OSV Vulnerability Detail Modal (Strictly Bounded Width)
@@ -2557,19 +2656,22 @@ func (m model) View() string {
 		displayStart = start + 1
 	}
 
-	keyHelp := "[Enter] Info  |  [Ctrl+Y] History  |  [Ctrl+D] Diff  |  [Ctrl+S] CSV  |  [Tab] Switch"
-	if m.hasOSV {
-		vulnTag := "[Ctrl+U] Vulns Only"
-		if m.showOnlyVulns {
-			vulnTag = "[Ctrl+U] Vulns Only [ACTIVE]"
-		}
-		keyHelp = vulnTag + "  |  [Ctrl+O] OSV Advisory  |  " + keyHelp
+	keyHelp := "[F1] Shortcuts"
+	if m.showOnlyVulns {
+		keyHelp += "  |  [Ctrl+U] Vulns [ACTIVE]"
 	}
 	counterText := fmt.Sprintf("Records: %d-%d / %d (Total: %d)", displayStart, end, len(m.filtered), len(m.allItems))
 
-	footerText := fmt.Sprintf("%s   •   %s", keyHelp, counterText)
-	footerContent := truncate(footerText, innerWidth)
+	leftW := lipgloss.Width(keyHelp)
+	rightW := lipgloss.Width(counterText)
 
+	gapFooter := innerWidth - leftW - rightW
+	if gapFooter < 0 {
+		gapFooter = 0
+		counterText = truncate(counterText, innerWidth-leftW)
+	}
+
+	footerContent := lipgloss.JoinHorizontal(lipgloss.Top, keyHelp, strings.Repeat(" ", gapFooter), counterText)
 	footerBox := footerBoxStyle.Width(innerWidth + 2).Render(footerContent)
 
 	ui := lipgloss.JoinVertical(lipgloss.Left,
