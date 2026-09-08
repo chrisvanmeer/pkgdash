@@ -14,12 +14,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dlclark/regexp2"
 )
 
 type Vulnerability struct {
@@ -759,8 +760,12 @@ func createFieldMatcher(query string) func(string) bool {
 		return func(s string) bool { return true }
 	}
 	if isLikelyRegex(query) {
-		if re, err := regexp.Compile("(?i)" + query); err == nil {
-			return func(s string) bool { return re.MatchString(s) }
+		re, err := regexp2.Compile(query, regexp2.IgnoreCase)
+		if err == nil {
+			return func(s string) bool {
+				matched, _ := re.MatchString(s)
+				return matched
+			}
 		}
 	}
 	terms := strings.Fields(strings.ToLower(query))

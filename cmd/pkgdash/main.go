@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +22,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/dlclark/regexp2"
 )
 
 // ============================================================================
@@ -1642,9 +1642,13 @@ func createFieldMatcher(query string) func(string) bool {
 	}
 
 	if isLikelyRegex(query) {
-		re, err := regexp.Compile("(?i)" + query)
+		// regexp2.IgnoreCase vervangt de handmatige "(?i)" string-prefix
+		re, err := regexp2.Compile(query, regexp2.IgnoreCase)
 		if err == nil {
-			return func(s string) bool { return re.MatchString(s) }
+			return func(s string) bool {
+				matched, _ := re.MatchString(s)
+				return matched
+			}
 		}
 	}
 
