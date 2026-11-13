@@ -444,11 +444,14 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 	sort.Slice(filtered, func(i, j int) bool {
 		a, b := filtered[i], filtered[j]
 		ah, bh := strings.ToLower(a.Hostname), strings.ToLower(b.Hostname)
+		ao, bo := strings.ToLower(osLabel(a.OSName, a.OSVersion)), strings.ToLower(osLabel(b.OSName, b.OSVersion))
 		ap, bp := strings.ToLower(a.PkgName), strings.ToLower(b.PkgName)
 		av, bv := a.Version, b.Version
 
 		var primaryLess, primaryEqual bool
 		switch sortCol {
+		case "os":
+			primaryLess, primaryEqual = ao < bo, ao == bo
 		case "pkg":
 			primaryLess, primaryEqual = ap < bp, ap == bp
 		case "ver":
@@ -780,6 +783,14 @@ func createFieldMatcher(query string) func(string) bool {
 	}
 }
 
+func osLabel(name, version string) string {
+	label := strings.TrimSpace(strings.TrimSpace(name) + " " + strings.TrimSpace(version))
+	if label == "" {
+		return "Unknown"
+	}
+	return label
+}
+
 func isLikelyRegex(query string) bool {
 	for _, char := range []string{"^", "$", "*", "+", "?", "[", "]", "(", ")", "{", "}", "|", "\\"} {
 		if strings.Contains(query, char) {
@@ -829,6 +840,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 		}
 		return fmt.Sprintf("%.1f", sev)
 	},
+	"osLabel": osLabel,
 }).Parse(`
 {{define "index"}}
 <!DOCTYPE html>
@@ -1097,6 +1109,17 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
                     if (document.getElementById('vulnOnlyHidden')) {
                         toggleVulns();
                     }
+                } else if (key === 'o') {
+                    e.preventDefault();
+                    const sortInput = document.getElementById('sort-col');
+                    const descInput = document.getElementById('sort-desc');
+                    if (sortInput.value === 'os') {
+                        descInput.value = descInput.value === 'true' ? 'false' : 'true';
+                    } else {
+                        sortInput.value = 'os';
+                        descInput.value = 'false';
+                    }
+                    htmx.ajax('GET', '/table', {target: '#table-container', source: '#filter-form'});
                 }
             }
         });
@@ -1144,9 +1167,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <table>
         <thead>
             <tr>
-                <th style="width:28%" data-sort="host"> HOSTNAME {{if eq .SortCol "host"}}{{if .SortDesc}}▼{{else}}▲{{end}}{{end}}</th>
-                <th style="width:42%" data-sort="pkg"> PACKAGE NAME {{if eq .SortCol "pkg"}}{{if .SortDesc}}▼{{else}}▲{{end}}{{end}}</th>
-                <th style="width:30%" data-sort="ver"> VERSION {{if eq .SortCol "ver"}}{{if .SortDesc}}▼{{else}}▲{{end}}{{end}}</th>
+                <th style="width:20%" data-sort="host"> HOSTNAME {{if eq .SortCol "host"}}{{if .SortDesc}}▼{{else}}▲{{end}}{{end}}</th>
+                <th style="width:20%" data-sort="os"> OS / VERSION {{if eq .SortCol "os"}}{{if .SortDesc}}▼{{else}}▲{{end}}{{end}}</th>
+                <th style="width:34%" data-sort="pkg"> PACKAGE NAME {{if eq .SortCol "pkg"}}{{if .SortDesc}}▼{{else}}▲{{end}}{{end}}</th>
+                <th style="width:26%" data-sort="ver"> VERSION {{if eq .SortCol "ver"}}{{if .SortDesc}}▼{{else}}▲{{end}}{{end}}</th>
             </tr>
         </thead>
         <tbody>
@@ -1164,6 +1188,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     {{$hasVuln := and $hasOSV .Vulnerabilities}}
     <tr {{if $hasVuln}}class="vuln-row"{{end}} hx-get="/modal/host?h={{.Hostname}}&p={{.PkgName}}" hx-target="#host-dialog-content" onclick="document.getElementById('hostModal').showModal()">
         <td>  {{.Hostname}}</td>
+        <td>{{osLabel .OSName .OSVersion}}</td>
         <td>{{.PkgName}}</td>
         <td>{{.Version}}{{if $hasVuln}} ⚠️{{end}}</td>
     </tr>
@@ -1171,7 +1196,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
 
     {{if .HasNext}}
     <tr id="loader-{{.NextPage}}" hx-get="/table?page={{.NextPage}}" hx-include="#filter-form" hx-trigger="revealed" hx-swap="outerHTML">
-        <td colspan="3" style="text-align:center; padding: 1rem; color: var(--muted); font-style: italic;">Loading more records...</td>
+        <td colspan="4" style="text-align:center; padding: 1rem; color: var(--muted); font-style: italic;">Loading more records...</td>
     </tr>
     {{end}}
 

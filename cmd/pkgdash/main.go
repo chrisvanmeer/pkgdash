@@ -93,6 +93,7 @@ type SortColumn int
 
 const (
 	SortHostname SortColumn = iota
+	SortOS
 	SortPackage
 	SortVersion
 )
@@ -243,6 +244,14 @@ var (
 			Padding(1, 3).
 			Align(lipgloss.Center)
 )
+
+func formatOSLabel(name, version string) string {
+	label := strings.TrimSpace(strings.TrimSpace(name) + " " + strings.TrimSpace(version))
+	if label == "" {
+		return "Unknown"
+	}
+	return label
+}
 
 func renderSevBadge(sev float64) string {
 	if sev <= 0 {
@@ -690,6 +699,7 @@ func (m *model) sortData() {
 		a, b := m.allItems[i], m.allItems[j]
 
 		ah, bh := strings.ToLower(a.Hostname), strings.ToLower(b.Hostname)
+		ao, bo := strings.ToLower(formatOSLabel(a.OSName, a.OSVersion)), strings.ToLower(formatOSLabel(b.OSName, b.OSVersion))
 		ap, bp := strings.ToLower(a.PkgName), strings.ToLower(b.PkgName)
 		av, bv := a.Version, b.Version
 
@@ -699,6 +709,9 @@ func (m *model) sortData() {
 		case SortHostname:
 			primaryLess = ah < bh
 			primaryEqual = ah == bh
+		case SortOS:
+			primaryLess = ao < bo
+			primaryEqual = ao == bo
 		case SortPackage:
 			primaryLess = ap < bp
 			primaryEqual = ap == bp
@@ -1110,7 +1123,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.String() {
-			case "esc", "enter", "ctrl+c", "ctrl+o", "q":
+			case "esc", "enter", "ctrl+c", "ctrl+a", "q":
 				m.showOSVModal = false
 				return m, nil
 
@@ -1222,7 +1235,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showHostModal = false
 				return m, nil
 
-			case "ctrl+o":
+			case "ctrl+a":
 				if m.showHostModal && len(m.selectedHost.Vulnerabilities) > 0 {
 					m.selectedOSVPkg = m.selectedHost.PkgName
 					m.selectedOSVVer = m.selectedHost.Version
@@ -1416,7 +1429,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// 7. Main View Keyboard Navigation
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" && msg.String() != "ctrl+o" && msg.String() != "ctrl+u" {
+		if msg.String() != "ctrl+s" && msg.String() != "ctrl+e" && msg.String() != "ctrl+a" && msg.String() != "ctrl+u" {
 			m.flashMsg = ""
 		}
 
@@ -1443,7 +1456,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case "ctrl+o":
+		case "ctrl+a":
 			if len(m.filtered) > 0 && m.cursor < len(m.filtered) {
 				item := m.filtered[m.cursor]
 				if len(item.Vulnerabilities) > 0 {
@@ -1528,6 +1541,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "pgdown":
 			m.cursor += m.visibleLines
+			m.updateViewport()
+			return m, nil
+
+		case "ctrl+o":
+			if m.sortCol == SortOS {
+				m.sortDesc = !m.sortDesc
+			} else {
+				m.sortCol = SortOS
+				m.sortDesc = false
+			}
+			m.sortData()
+			m.cursor = 0
 			m.updateViewport()
 			return m, nil
 
@@ -1771,11 +1796,11 @@ func (m model) View() string {
 			{key: "Tab / Shift+Tab", desc: "Switch search input field"},
 			{key: "▲ / ▼  (Ctrl+K/J)", desc: "Navigate table rows"},
 			{key: "PgUp / PgDown", desc: "Scroll full page"},
-			{key: "Ctrl+H / P / V", desc: "Sort by Host / Package / Version"},
+			{key: "Ctrl+H / P / O / V", desc: "Sort by Host / Package / OS / Version"},
 
 			{key: "VIEWS & MODALS", isCat: true},
 			{key: "Enter", desc: "Open Host overview & change history"},
-			{key: "Ctrl+O", desc: "Open OSV Security Advisory"},
+			{key: "Ctrl+A", desc: "Open OSV Security Advisory"},
 			{key: "Ctrl+Y", desc: "Open Fleet Audit Log (Timeline)"},
 			{key: "Ctrl+D", desc: "Compare host packages (Diff tool)"},
 			{key: "Ctrl+C", desc: "About Pkgdash Control Center"},
@@ -2218,7 +2243,7 @@ func (m model) View() string {
 
 		helpBar := "[Tab] Switch Tab  |  [Enter] Inspect Full Timeline  |  [Esc] Close"
 		if len(m.selectedHost.Vulnerabilities) > 0 {
-			helpBar = "[Ctrl+O] View OSV Advisory  |  " + helpBar
+			helpBar = "[Ctrl+A] View OSV Advisory  |  " + helpBar
 		}
 
 		modalContent := lipgloss.JoinVertical(lipgloss.Left,
@@ -2563,11 +2588,13 @@ func (m model) View() string {
 	filterPanel := lipgloss.JoinHorizontal(lipgloss.Left, cardHost, cardPkg, cardVer)
 
 	// --- MAIN TABLE ---
-	tw1 := int(float64(innerWidth) * 0.28)
-	tw2 := int(float64(innerWidth) * 0.42)
-	tw3 := innerWidth - tw1 - tw2
+	tw1 := int(float64(innerWidth) * 0.23)
+	tw2 := int(float64(innerWidth) * 0.21)
+	tw3 := int(float64(innerWidth) * 0.31)
+	tw4 := innerWidth - tw1 - tw2 - tw3
 
 	hHostText := " HOSTNAME"
+	hOSText := " OS / VERSION"
 	hPkgText := " PACKAGE NAME"
 	hVerText := " VERSION"
 
@@ -2579,6 +2606,8 @@ func (m model) View() string {
 	switch m.sortCol {
 	case SortHostname:
 		hHostText += indicator
+	case SortOS:
+		hOSText += indicator
 	case SortPackage:
 		hPkgText += indicator
 	case SortVersion:
@@ -2586,10 +2615,11 @@ func (m model) View() string {
 	}
 
 	hHost := tableHeaderStyle.Width(tw1).MaxWidth(tw1).Render(truncate(hHostText, tw1))
-	hPkg := tableHeaderStyle.Width(tw2).MaxWidth(tw2).Render(truncate(hPkgText, tw2))
-	hVer := tableHeaderStyle.Width(tw3).MaxWidth(tw3).Render(truncate(hVerText, tw3))
+	hOS := tableHeaderStyle.Width(tw2).MaxWidth(tw2).Render(truncate(hOSText, tw2))
+	hPkg := tableHeaderStyle.Width(tw3).MaxWidth(tw3).Render(truncate(hPkgText, tw3))
+	hVer := tableHeaderStyle.Width(tw4).MaxWidth(tw4).Render(truncate(hVerText, tw4))
 
-	tableHeader := lipgloss.JoinHorizontal(lipgloss.Left, hHost, hPkg, hVer)
+	tableHeader := lipgloss.JoinHorizontal(lipgloss.Left, hHost, hOS, hPkg, hVer)
 
 	var rowStrs []string
 	start := m.offset
@@ -2610,36 +2640,31 @@ func (m model) View() string {
 			rHostRaw = "❯ " + item.Hostname
 		}
 
+		rOSRaw := " " + formatOSLabel(item.OSName, item.OSVersion)
 		rPkgRaw := " " + item.PkgName
 		rVerRaw := " " + item.Version
 		if hasVuln {
 			rVerRaw += " ⚠️"
 		}
 
-		var rHost, rPkg, rVer string
+		rowStyle := rowStyleNormal
+		if hasVuln {
+			rowStyle = vulnRowStyle
+		}
 		if isSelected {
 			if hasVuln {
-				rHost = selectedVulnStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
-				rPkg = selectedVulnStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
-				rVer = selectedVulnStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
+				rowStyle = selectedVulnStyle
 			} else {
-				rHost = selectedStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
-				rPkg = selectedStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
-				rVer = selectedStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
-			}
-		} else {
-			if hasVuln {
-				rHost = vulnRowStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
-				rPkg = vulnRowStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
-				rVer = vulnRowStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
-			} else {
-				rHost = rowStyleNormal.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
-				rPkg = rowStyleNormal.Width(tw2).MaxWidth(tw2).Render(truncate(rPkgRaw, tw2))
-				rVer = rowStyleNormal.Width(tw3).MaxWidth(tw3).Render(truncate(rVerRaw, tw3))
+				rowStyle = selectedStyle
 			}
 		}
 
-		rowStrs = append(rowStrs, lipgloss.JoinHorizontal(lipgloss.Left, rHost, rPkg, rVer))
+		rHost := rowStyle.Width(tw1).MaxWidth(tw1).Render(truncate(rHostRaw, tw1))
+		rOS := rowStyle.Width(tw2).MaxWidth(tw2).Render(truncate(rOSRaw, tw2))
+		rPkg := rowStyle.Width(tw3).MaxWidth(tw3).Render(truncate(rPkgRaw, tw3))
+		rVer := rowStyle.Width(tw4).MaxWidth(tw4).Render(truncate(rVerRaw, tw4))
+
+		rowStrs = append(rowStrs, lipgloss.JoinHorizontal(lipgloss.Left, rHost, rOS, rPkg, rVer))
 	}
 
 	for i := len(viewport); i < m.visibleLines; i++ {
