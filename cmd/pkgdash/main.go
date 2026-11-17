@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/dlclark/regexp2"
 )
 
@@ -30,6 +31,7 @@ import (
 // ============================================================================
 const (
 	PlaceholderHost = "Filter hostname..."
+	PlaceholderOS   = "Filter OS..."
 	PlaceholderPkg  = "Filter package..."
 	PlaceholderVer  = "Filter version..."
 )
@@ -289,6 +291,7 @@ type model struct {
 	minSev  float64
 
 	hostInput    textinput.Model
+	osInput      textinput.Model
 	pkgInput     textinput.Model
 	verInput     textinput.Model
 	focusedInput int
@@ -384,6 +387,10 @@ func main() {
 	hi.Prompt = ""
 	hi.Focus()
 
+	oi := textinput.New()
+	oi.Placeholder = PlaceholderOS
+	oi.Prompt = ""
+
 	pi := textinput.New()
 	pi.Placeholder = PlaceholderPkg
 	pi.Prompt = ""
@@ -419,6 +426,7 @@ func main() {
 		psk:             psk,
 		minSev:          minSev,
 		hostInput:       hi,
+		osInput:         oi,
 		pkgInput:        pi,
 		verInput:        vi,
 		diffHostAInput:  diffA,
@@ -678,9 +686,10 @@ func waitForUpdate(sub chan dataMsg) tea.Cmd {
 }
 
 func (m *model) switchFocus(target int) {
-	m.focusedInput = (target + 3) % 3
+	m.focusedInput = (target + 4) % 4
 
 	m.hostInput.Blur()
+	m.osInput.Blur()
 	m.pkgInput.Blur()
 	m.verInput.Blur()
 
@@ -688,8 +697,10 @@ func (m *model) switchFocus(target int) {
 	case 0:
 		m.hostInput.Focus()
 	case 1:
-		m.pkgInput.Focus()
+		m.osInput.Focus()
 	case 2:
+		m.pkgInput.Focus()
+	case 3:
 		m.verInput.Focus()
 	}
 }
@@ -1611,8 +1622,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	var hPrev, pPrev, vPrev string
+	var hPrev, oPrev, pPrev, vPrev string
 	hPrev = m.hostInput.Value()
+	oPrev = m.osInput.Value()
 	pPrev = m.pkgInput.Value()
 	vPrev = m.verInput.Value()
 
@@ -1620,12 +1632,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case 0:
 		m.hostInput, cmd = m.hostInput.Update(msg)
 	case 1:
-		m.pkgInput, cmd = m.pkgInput.Update(msg)
+		m.osInput, cmd = m.osInput.Update(msg)
 	case 2:
+		m.pkgInput, cmd = m.pkgInput.Update(msg)
+	case 3:
 		m.verInput, cmd = m.verInput.Update(msg)
 	}
 
-	if m.hostInput.Value() != hPrev || m.pkgInput.Value() != pPrev || m.verInput.Value() != vPrev {
+	if m.hostInput.Value() != hPrev || m.osInput.Value() != oPrev || m.pkgInput.Value() != pPrev || m.verInput.Value() != vPrev {
 		m.filterItems()
 		m.cursor = 0
 		m.updateViewport()
@@ -1636,15 +1650,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) filterItems() {
 	hQuery := strings.TrimSpace(m.hostInput.Value())
+	oQuery := strings.TrimSpace(m.osInput.Value())
 	pQuery := strings.TrimSpace(m.pkgInput.Value())
 	vQuery := strings.TrimSpace(m.verInput.Value())
 
-	if hQuery == "" && pQuery == "" && vQuery == "" && !m.showOnlyVulns {
+	if hQuery == "" && oQuery == "" && pQuery == "" && vQuery == "" && !m.showOnlyVulns {
 		m.filtered = m.allItems
 		return
 	}
 
 	hMatch := createFieldMatcher(hQuery)
+	oMatch := createFieldMatcher(oQuery)
 	pMatch := createFieldMatcher(pQuery)
 	vMatch := createFieldMatcher(vQuery)
 
@@ -1653,7 +1669,7 @@ func (m *model) filterItems() {
 		if m.showOnlyVulns && len(item.Vulnerabilities) == 0 {
 			continue
 		}
-		if hMatch(item.Hostname) && pMatch(item.PkgName) && vMatch(item.Version) {
+		if hMatch(item.Hostname) && oMatch(formatOSLabel(item.OSName, item.OSVersion)) && pMatch(item.PkgName) && vMatch(item.Version) {
 			filtered = append(filtered, item)
 		}
 	}
@@ -1747,18 +1763,60 @@ func renderActionBadge(action string) string {
 	}
 }
 
+// truncate limits text to a visual column width. Emojis and ANSI styling must
+// not make a cell wider than its allocated columns, otherwise joined panels
+// drift out of alignment.
 func truncate(str string, maxLen int) string {
 	if maxLen <= 0 {
 		return ""
 	}
-	runes := []rune(str)
-	if len(runes) > maxLen {
-		if maxLen > 3 {
-			return string(runes[:maxLen-3]) + "..."
-		}
-		return string(runes[:maxLen])
+	tail := "..."
+	if maxLen < len(tail) {
+		tail = strings.Repeat(".", maxLen)
 	}
-	return str
+	return ansi.Truncate(str, maxLen, tail)
+}
+
+// distributeWidths splits a total width over relative weights, keeping a minimum
+// width per column and handing out rounding leftovers so the sum stays exactly
+// equal to total. This keeps the filter cards aligned with the other panels.
+func distributeWidths(total int, weights []float64, minWidth int) []int {
+	widths := make([]int, len(weights))
+	if len(weights) == 0 {
+		return widths
+	}
+
+	evenSplit := func() []int {
+		base := total / len(weights)
+		for i := range widths {
+			widths[i] = base
+		}
+		for i := 0; i < total%len(weights); i++ {
+			widths[i]++
+		}
+		return widths
+	}
+
+	sum := 0.0
+	for _, w := range weights {
+		sum += w
+	}
+	if total < minWidth*len(weights) || sum <= 0 {
+		return evenSplit()
+	}
+
+	remaining := total - minWidth*len(weights)
+	assigned := 0
+	for i, w := range weights {
+		extra := int(float64(remaining) * w / sum)
+		widths[i] = minWidth + extra
+		assigned += extra
+	}
+	for i := 0; assigned < remaining; i = (i + 1) % len(widths) {
+		widths[i]++
+		assigned++
+	}
+	return widths
 }
 
 func (m model) View() string {
@@ -2534,13 +2592,8 @@ func (m model) View() string {
 	headerCard := headerPanelStyle.Render(headerContent)
 
 	// --- SEARCH FILTER CARDS ---
-	cw1 := int(float64(availWidth)*0.28) + 2
-	cw2 := int(float64(availWidth)*0.40) + 1
-	cw3 := availWidth - cw1 - cw2
-
-	m.hostInput.Width = cw1 - 5
-	m.pkgInput.Width = cw2 - 5
-	m.verInput.Width = cw3 - 5
+	cardWidths := distributeWidths(availWidth, []float64{0.24, 0.22, 0.34, 0.20}, 15)
+	cw1, cw2, cw3, cw4 := cardWidths[0], cardWidths[1], cardWidths[2], cardWidths[3]
 
 	renderFilterCard := func(title string, input textinput.Model, isFocused bool, query string, cardTotalWidth int) string {
 		var lStyle, bStyle lipgloss.Style
@@ -2555,37 +2608,57 @@ func (m model) View() string {
 			bStyle = filterBoxBlurred
 		}
 
-		safeInnerW := cardTotalWidth - 2
-		if safeInnerW < 1 {
-			safeInnerW = 1
+		// lipgloss.Width includes the style's horizontal padding; the border is
+		// added on top. Keep every content line inside the remaining space so
+		// cards never wrap and the whole filter row stays exactly availWidth.
+		boxWidth := cardTotalWidth - 2
+		if boxWidth < 1 {
+			boxWidth = 1
+		}
+		contentWidth := boxWidth - 2
+		if contentWidth < 1 {
+			contentWidth = 1
 		}
 
-		safeTitleLen := safeInnerW - 6
-		if safeTitleLen < 1 {
-			safeTitleLen = 1
+		input.Width = contentWidth - lipgloss.Width(promptChar)
+		if input.Width < 1 {
+			input.Width = 1
 		}
-		safeTitle := truncate(title, safeTitleLen)
 
+		// On very narrow cards, drop the mode badge so the label stays readable.
+		modeWidth := 0
 		var modeIndicator string
-		if isLikelyRegex(query) {
-			modeIndicator = regexBadgeActive.Render("[REG]")
-		} else {
-			modeIndicator = regexBadgeInactive.Render("[TXT]")
+		if contentWidth >= 13 {
+			modeWidth = 6 // " [TXT]" / " [REG]"
+			if isLikelyRegex(query) {
+				modeIndicator = regexBadgeActive.Render("[REG]")
+			} else {
+				modeIndicator = regexBadgeInactive.Render("[TXT]")
+			}
 		}
 
-		headerLine := lipgloss.JoinHorizontal(lipgloss.Left, lStyle.Render(safeTitle), " ", modeIndicator)
+		titleWidth := contentWidth - modeWidth
+		if titleWidth < 1 {
+			titleWidth = 1
+		}
+		safeTitle := truncate(title, titleWidth)
+		headerLine := lStyle.Render(safeTitle)
+		if modeWidth > 0 {
+			headerLine = lipgloss.JoinHorizontal(lipgloss.Left, headerLine, " ", modeIndicator)
+		}
 		inputLine := lipgloss.JoinHorizontal(lipgloss.Left, lStyle.Render(promptChar), input.View())
 
 		cardContent := lipgloss.JoinVertical(lipgloss.Left, headerLine, inputLine)
 
-		return bStyle.Width(safeInnerW).Render(cardContent)
+		return bStyle.Width(boxWidth).Render(cardContent)
 	}
 
 	cardHost := renderFilterCard("HOST", m.hostInput, m.focusedInput == 0, m.hostInput.Value(), cw1)
-	cardPkg := renderFilterCard("PACKAGE", m.pkgInput, m.focusedInput == 1, m.pkgInput.Value(), cw2)
-	cardVer := renderFilterCard("VERSION", m.verInput, m.focusedInput == 2, m.verInput.Value(), cw3)
+	cardOS := renderFilterCard("OS", m.osInput, m.focusedInput == 1, m.osInput.Value(), cw2)
+	cardPkg := renderFilterCard("PACKAGE", m.pkgInput, m.focusedInput == 2, m.pkgInput.Value(), cw3)
+	cardVer := renderFilterCard("VERSION", m.verInput, m.focusedInput == 3, m.verInput.Value(), cw4)
 
-	filterPanel := lipgloss.JoinHorizontal(lipgloss.Left, cardHost, cardPkg, cardVer)
+	filterPanel := lipgloss.JoinHorizontal(lipgloss.Left, cardHost, cardOS, cardPkg, cardVer)
 
 	// --- MAIN TABLE ---
 	tw1 := int(float64(innerWidth) * 0.23)
