@@ -8,6 +8,89 @@ import (
 	"time"
 )
 
+func TestFilterAndSortCachesUnfilteredResult(t *testing.T) {
+	dataMutex.Lock()
+	oldItems := globalItems
+	globalItems = []FlatItem{
+		{Hostname: "b", PkgName: "z", Version: "1.9"},
+		{Hostname: "a", PkgName: "y", Version: "1.10"},
+		{Hostname: "c", PkgName: "x", Version: "1.2"},
+	}
+	dataMutex.Unlock()
+
+	sortCacheMu.Lock()
+	oldCache := sortCache
+	sortCache = make(map[sortCacheKey]sortCacheEntry)
+	sortCacheMu.Unlock()
+
+	defer func() {
+		dataMutex.Lock()
+		globalItems = oldItems
+		dataMutex.Unlock()
+		sortCacheMu.Lock()
+		sortCache = oldCache
+		sortCacheMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/table?sort=host", nil)
+	first, h1, v1, vuln1 := filterAndSort(req)
+	second, h2, v2, vuln2 := filterAndSort(req)
+
+	if len(first) != 3 || first[0].Hostname != "a" || first[2].Hostname != "c" {
+		t.Fatalf("unexpected sorted result: %+v", first)
+	}
+	if len(second) != len(first) || second[0].Hostname != first[0].Hostname {
+		t.Fatalf("cached result differs: %+v vs %+v", second, first)
+	}
+	if h1 != h2 || v1 != v2 || vuln1 != vuln2 {
+		t.Fatalf("cached stats differ: %d/%d/%d vs %d/%d/%d", h1, v1, vuln1, h2, v2, vuln2)
+	}
+
+	sortCacheMu.RLock()
+	cacheSize := len(sortCache)
+	sortCacheMu.RUnlock()
+	if cacheSize != 1 {
+		t.Fatalf("sort cache has %d entries, want 1", cacheSize)
+	}
+}
+
+func TestFilterAndSortQueryNotCached(t *testing.T) {
+	dataMutex.Lock()
+	oldItems := globalItems
+	globalItems = []FlatItem{
+		{Hostname: "web-01", PkgName: "nginx", Version: "1.25"},
+		{Hostname: "db-01", PkgName: "postgres", Version: "16"},
+	}
+	dataMutex.Unlock()
+
+	sortCacheMu.Lock()
+	oldCache := sortCache
+	sortCache = make(map[sortCacheKey]sortCacheEntry)
+	sortCacheMu.Unlock()
+
+	defer func() {
+		dataMutex.Lock()
+		globalItems = oldItems
+		dataMutex.Unlock()
+		sortCacheMu.Lock()
+		sortCache = oldCache
+		sortCacheMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/table?host=web", nil)
+	got, _, _, _ := filterAndSort(req)
+	if len(got) != 1 || got[0].Hostname != "web-01" {
+		t.Fatalf("unexpected filtered result: %+v", got)
+	}
+
+	sortCacheMu.RLock()
+	cacheSize := len(sortCache)
+	sortCacheMu.RUnlock()
+	if cacheSize != 0 {
+		t.Fatalf("query result was cached (%d entries)", cacheSize)
+	}
+}
+
 func TestWithSecurityAuthentication(t *testing.T) {
 	oldAuth := authPSK
 	oldTrust := trustProxy

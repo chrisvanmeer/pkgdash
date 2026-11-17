@@ -34,10 +34,24 @@ type (
 	ChangeEvent   = pkgdash.ChangeEvent
 )
 
+type sortCacheKey struct {
+	field      pkgdash.SortField
+	descending bool
+}
+
+type sortCacheEntry struct {
+	items     []FlatItem
+	hostCount int
+	verCount  int
+	vulnCount int
+}
+
 var (
 	globalItems       []FlatItem
 	lastUpdated       time.Time
 	dataMutex         sync.RWMutex
+	sortCacheMu       sync.RWMutex
+	sortCache         = make(map[sortCacheKey]sortCacheEntry)
 	serversConfig     []string
 	pskConfig         string
 	authPSK           string
@@ -311,6 +325,9 @@ func fetchAllData(servers []string, psk string) {
 	defer dataMutex.Unlock()
 	if successes > 0 {
 		globalItems = allItems
+		sortCacheMu.Lock()
+		sortCache = make(map[sortCacheKey]sortCacheEntry)
+		sortCacheMu.Unlock()
 		hasOSVGlobal = osvDetected
 		if !latestTime.IsZero() {
 			lastUpdated = latestTime
@@ -411,30 +428,52 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 	verQuery := r.URL.Query().Get("ver")
 	vulnOnly := r.URL.Query().Get("vulnOnly") == "true"
 
-	filtered := pkgdash.Filter(globalItems, hostQuery, osQuery, pkgQuery, verQuery, vulnOnly)
-	if hostQuery == "" && osQuery == "" && pkgQuery == "" && verQuery == "" && !vulnOnly {
-		// Filter returns the original slice for the no-query fast path. Copy it
-		// here because SortItems mutates its argument and globalItems is shared.
-		filtered = append([]FlatItem(nil), filtered...)
-	}
-
 	fields := map[string]pkgdash.SortField{
 		"os":  pkgdash.SortOS,
 		"pkg": pkgdash.SortPkg,
 		"ver": pkgdash.SortVer,
 	}
 	field := fields[r.URL.Query().Get("sort")]
-	pkgdash.SortItems(filtered, field, r.URL.Query().Get("desc") == "true")
+	descending := r.URL.Query().Get("desc") == "true"
 
-	hostMap := make(map[string]bool)
-	verMap := make(map[string]bool)
-	vulnCount := 0
-	for _, item := range filtered {
-		hostMap[item.Hostname] = true
-		verMap[item.Version] = true
-		vulnCount += len(item.Vulnerabilities)
+	countStats := func(items []FlatItem) (int, int, int) {
+		hostMap := make(map[string]bool)
+		verMap := make(map[string]bool)
+		vulnCount := 0
+		for _, item := range items {
+			hostMap[item.Hostname] = true
+			verMap[item.Version] = true
+			vulnCount += len(item.Vulnerabilities)
+		}
+		return len(hostMap), len(verMap), vulnCount
 	}
-	return filtered, len(hostMap), len(verMap), vulnCount
+
+	noQuery := hostQuery == "" && osQuery == "" && pkgQuery == "" && verQuery == "" && !vulnOnly
+	if noQuery {
+		// Sorting the full inventory on every HTTP request is expensive (163 MB
+		// of allocations for 185k rows). Cache the sorted snapshot per field and
+		// direction; it is invalidated whenever the daemon data is refreshed.
+		key := sortCacheKey{field: field, descending: descending}
+		sortCacheMu.RLock()
+		cached, ok := sortCache[key]
+		sortCacheMu.RUnlock()
+		if ok {
+			return cached.items, cached.hostCount, cached.verCount, cached.vulnCount
+		}
+
+		rows := append([]FlatItem(nil), globalItems...)
+		pkgdash.SortItems(rows, field, descending)
+		hCount, vCount, vulnCount := countStats(rows)
+		sortCacheMu.Lock()
+		sortCache[key] = sortCacheEntry{items: rows, hostCount: hCount, verCount: vCount, vulnCount: vulnCount}
+		sortCacheMu.Unlock()
+		return rows, hCount, vCount, vulnCount
+	}
+
+	filtered := pkgdash.Filter(globalItems, hostQuery, osQuery, pkgQuery, verQuery, vulnOnly)
+	pkgdash.SortItems(filtered, field, descending)
+	hCount, vCount, vulnCount := countStats(filtered)
+	return filtered, hCount, vCount, vulnCount
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {

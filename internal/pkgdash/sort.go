@@ -16,36 +16,49 @@ const (
 )
 
 type sortKey struct {
-	host    string
-	os      string
-	pkg     string
-	version versionTokenList
+	host        string
+	os          string
+	pkg         string
+	versionFrom int
+	versionLen  int
 }
 
 // SortItems sorts rows by the requested field. Ties are broken consistently by
 // hostname, package and version so both clients show the same order.
 func SortItems(items []FlatItem, field SortField, descending bool) {
-	// Compute the comparison keys once per row. The previous implementation
-	// lowercased strings and tokenized versions inside every comparison,
-	// which grew to millions of allocations for large inventories.
+	// Compute the comparison keys once per row. Version tokens live in one
+	// shared buffer with offsets per row instead of a separate slice allocation
+	// for every item, which was the dominant cost for large inventories.
 	type row struct {
 		item FlatItem
 		key  sortKey
 	}
 	rows := make([]row, len(items))
+	tokens := make([]versionToken, 0, len(items)*4)
+	needOS := field == SortOS
 	for i, item := range items {
-		rows[i] = row{
-			item: item,
-			key: sortKey{
-				host:    strings.ToLower(item.Hostname),
-				os:      strings.ToLower(OSLabel(item.OSName, item.OSVersion)),
-				pkg:     strings.ToLower(item.PkgName),
-				version: versionTokens(item.Version),
-			},
+		from := len(tokens)
+		tokens = appendVersionTokens(tokens, item.Version)
+		key := sortKey{
+			host:        strings.ToLower(item.Hostname),
+			pkg:         strings.ToLower(item.PkgName),
+			versionFrom: from,
+			versionLen:  len(tokens) - from,
 		}
+		if needOS {
+			key.os = strings.ToLower(OSLabel(item.OSName, item.OSVersion))
+		}
+		rows[i] = row{item: item, key: key}
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool {
+	version := func(k sortKey) versionTokenList {
+		return tokens[k.versionFrom : k.versionFrom+k.versionLen]
+	}
+	sameVersion := func(a, b sortKey) bool {
+		return versionTokensEqual(version(a), version(b))
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
 		a, b := rows[i].key, rows[j].key
 
 		var primaryLess, primaryEqual bool
@@ -55,7 +68,7 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 		case SortPkg:
 			primaryLess, primaryEqual = a.pkg < b.pkg, a.pkg == b.pkg
 		case SortVer:
-			primaryLess, primaryEqual = a.version.less(b.version), versionTokensEqual(a.version, b.version)
+			primaryLess, primaryEqual = version(a).less(version(b)), sameVersion(a, b)
 		default:
 			primaryLess, primaryEqual = a.host < b.host, a.host == b.host
 		}
@@ -67,7 +80,7 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 			case a.pkg != b.pkg:
 				return a.pkg < b.pkg
 			default:
-				return a.version.less(b.version)
+				return version(a).less(version(b))
 			}
 		}
 		if descending {
@@ -118,9 +131,10 @@ func (tokens versionTokenList) less(other versionTokenList) bool {
 	return len(a) < len(b)
 }
 
-func versionTokens(s string) versionTokenList {
+// appendVersionTokens tokenizes s directly into dst. Callers sorting large
+// inventories pass one shared buffer so no per-row slice is allocated.
+func appendVersionTokens(dst []versionToken, s string) []versionToken {
 	s = strings.ToLower(strings.TrimSpace(s))
-	var tokens []versionToken
 	for i := 0; i < len(s); {
 		if s[i] >= '0' && s[i] <= '9' {
 			end := i
@@ -129,7 +143,7 @@ func versionTokens(s string) versionTokenList {
 			}
 			value, err := strconv.Atoi(s[i:end])
 			if err == nil {
-				tokens = append(tokens, versionToken{number: true, value: value})
+				dst = append(dst, versionToken{number: true, value: value})
 			}
 			i = end
 			continue
@@ -138,8 +152,8 @@ func versionTokens(s string) versionTokenList {
 		for end < len(s) && (s[end] < '0' || s[end] > '9') {
 			end++
 		}
-		tokens = append(tokens, versionToken{text: s[i:end]})
+		dst = append(dst, versionToken{text: s[i:end]})
 		i = end
 	}
-	return tokens
+	return dst
 }
