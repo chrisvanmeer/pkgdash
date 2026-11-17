@@ -337,6 +337,9 @@ var (
 )
 
 func main() {
+	initTiming()
+	defer flushTiming()
+
 	flagMinSev := flag.Float64("min-severity", -1, "Minimum CVSS severity threshold to display vulnerabilities")
 	flagCAFile := flag.String("ca-file", "", "PEM file containing the CA that signed the daemon certificate")
 	flagCertFile := flag.String("cert-file", "", "Client certificate for mutual TLS")
@@ -458,12 +461,26 @@ func main() {
 }
 
 func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev float64, updateChan chan dataMsg) {
+	defer timingMeasure("fetchAllDataAsync: TOTAL")()
 	var wg sync.WaitGroup
 	send := func(msg dataMsg) bool {
+		if !timingEnabled {
+			select {
+			case <-ctx.Done():
+				return false
+			case updateChan <- msg:
+				return true
+			}
+		}
+		start := time.Now()
 		select {
 		case <-ctx.Done():
 			return false
 		case updateChan <- msg:
+			blocked := time.Since(start)
+			if blocked > 5*time.Millisecond {
+				timingLog("send BLOCKED %s (server=%s hosts=%d done=%v)", blocked, msg.server, len(msg.items), msg.isDone)
+			}
 			return true
 		}
 	}
@@ -472,6 +489,7 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 		wg.Add(1)
 		go func(server string) {
 			defer wg.Done()
+			defer timingMeasure("server %s: TOTAL", server)()
 			// Report failures through the UI instead of logging to stderr,
 			// which would corrupt Bubble Tea's alternate screen.
 			fail := func(format string, args ...any) {
@@ -494,7 +512,9 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 				req.Header.Set("X-PSK", psk)
 			}
 
+			httpDone := timingMeasure("server %s: http.Do -> response headers", server)
 			resp, err := apiClient.Do(req)
+			httpDone()
 			if err != nil {
 				if ctx.Err() == nil {
 					fail("%v", err)
@@ -506,6 +526,8 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 				fail("HTTP %s", resp.Status)
 				return
 			}
+
+			timingLog("server %s: HTTP %s, encoding=%q, content-length=%q", server, resp.Status, resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Length"))
 
 			osvHeaderActive := strings.EqualFold(resp.Header.Get("X-OSV-Enabled"), "true")
 
@@ -526,6 +548,7 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 			}
 
 			decoder := json.NewDecoder(reader)
+			decodeDone := timingMeasure("server %s: decode+flatten ALL hosts", server)
 			token, err := decoder.Token()
 			if err != nil {
 				fail("invalid response: %v", err)
@@ -536,12 +559,19 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 				return
 			}
 
+			hostCount, itemCount := 0, 0
 			for decoder.More() {
+				hostStart := time.Now()
 				var host HostPayload
 				if err := decoder.Decode(&host); err != nil {
 					fail("invalid host record: %v", err)
 					return
 				}
+				if d := time.Since(hostStart); d > 20*time.Millisecond {
+					timingLog("server %s: SLOW host %s decode %s (%d pkgs)", server, host.Hostname, d, len(host.Packages))
+				}
+				hostCount++
+				itemCount += len(host.Packages)
 
 				isOSV := osvHeaderActive || host.OSVEnabled
 				var localItems []FlatItem
@@ -575,6 +605,8 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 					return
 				}
 			}
+			decodeDone()
+			timingLog("server %s: decoded %d hosts / %d packages", server, hostCount, itemCount)
 			// An empty but successful response clears any previous issue.
 			send(dataMsg{server: server})
 		}(s)
@@ -582,6 +614,7 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 
 	go func() {
 		wg.Wait()
+		timingLog("all servers finished -> sending isDone")
 		send(dataMsg{isDone: true})
 	}()
 }
@@ -734,6 +767,7 @@ func (m *model) switchFocus(target int) {
 }
 
 func (m *model) sortData() {
+	defer timingMeasure("TUI: sortData (%d items)", len(m.allItems))()
 	fields := []pkgdash.SortField{pkgdash.SortHost, pkgdash.SortOS, pkgdash.SortPkg, pkgdash.SortVer}
 	pkgdash.SortItems(m.allItems, fields[m.sortCol], m.sortDesc)
 	m.filterItems()
@@ -990,6 +1024,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case dataMsg:
+		defer timingMeasure("TUI: Update dataMsg (server=%s hosts=%d done=%v)", msg.server, len(msg.items), msg.isDone)()
 		if msg.hasOSV {
 			m.hasOSV = true
 		}
@@ -1571,6 +1606,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) filterItems() {
+	defer timingMeasure("TUI: filterItems (%d items)", len(m.allItems))()
 	m.filtered = pkgdash.Filter(
 		m.allItems,
 		m.hostInput.Value(),
@@ -1702,7 +1738,13 @@ func distributeWidths(total int, weights []float64, minWidth int) []int {
 	return widths
 }
 
-func (m model) View() string {
+func (m model) View() (view string) {
+	viewStart := time.Now()
+	defer func() {
+		if d := time.Since(viewStart); d > 20*time.Millisecond {
+			timingLog("TUI: SLOW View %s (%d visible rows)", d, m.visibleLines)
+		}
+	}()
 	if !m.ready {
 		return "Initializing Dashboard..."
 	}
