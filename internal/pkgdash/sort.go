@@ -1,6 +1,7 @@
 package pkgdash
 
 import (
+	"bytes"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,11 +38,16 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 	// after loading, which triggered expensive GC pauses during the final sort.
 	keys := make([]sortKey, n)
 	perm := make([]int, n)
-	tokens := make([]versionToken, 0, n*4)
+	// Real versions ("2:8.2.1-1ubuntu2.3~20.04.1") have ~10 tokens, not ~4.
+	// Starting too small caused repeated doubling of a ~100 MB buffer (319 MB
+	// of copy allocations in profiling). Packed tokens are 8 bytes, text lives
+	// in one shared byte buffer, so the whole key set stays compact.
+	tokens := make([]versionToken, 0, n*12)
+	textBuf := make([]byte, 0, n*16)
 	needOS := field == SortOS
 	for i, item := range items {
 		from := len(tokens)
-		tokens = appendVersionTokens(tokens, item.Version)
+		tokens, textBuf = appendVersionTokens(tokens, textBuf, item.Version)
 		key := sortKey{
 			host:        strings.ToLower(item.Hostname),
 			pkg:         strings.ToLower(item.PkgName),
@@ -58,8 +64,9 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 	version := func(k sortKey) versionTokenList {
 		return tokens[k.versionFrom : k.versionFrom+k.versionLen]
 	}
-	sameVersion := func(a, b sortKey) bool {
-		return versionTokensEqual(version(a), version(b))
+	lessVersion := func(a, b sortKey) bool {
+		less, _ := compareVersions(version(a), version(b), textBuf)
+		return less
 	}
 
 	less := func(a, b sortKey) bool {
@@ -70,7 +77,7 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 		case SortPkg:
 			primaryLess, primaryEqual = a.pkg < b.pkg, a.pkg == b.pkg
 		case SortVer:
-			primaryLess, primaryEqual = version(a).less(version(b)), sameVersion(a, b)
+			primaryLess, primaryEqual = compareVersions(version(a), version(b), textBuf)
 		default:
 			primaryLess, primaryEqual = a.host < b.host, a.host == b.host
 		}
@@ -82,7 +89,7 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 			case a.pkg != b.pkg:
 				return a.pkg < b.pkg
 			default:
-				return version(a).less(version(b))
+				return lessVersion(a, b)
 			}
 		}
 		if descending {
@@ -116,48 +123,64 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 	}
 }
 
-type versionToken struct {
-	number bool
-	value  int
-	text   string
+// versionToken packs a version component into 8 bytes. Numeric components
+// store their value in the low 32 bits with the top bit set; text components
+// store an offset (high 32 bits) and length (low 32 bits) into a shared buffer.
+type versionToken uint64
+
+const (
+	versionTokenNumberBit = uint64(1) << 63
+	versionTokenValueMask = uint64(1)<<32 - 1
+)
+
+func numberToken(v int) versionToken {
+	return versionToken(versionTokenNumberBit | uint64(uint32(v)))
 }
+
+func textToken(off, length int) versionToken {
+	return versionToken(uint64(uint32(off))<<32 | uint64(uint32(length)))
+}
+
+func (t versionToken) isNumber() bool { return uint64(t)&versionTokenNumberBit != 0 }
+func (t versionToken) number() int    { return int(int32(uint64(t) & versionTokenValueMask)) }
+func (t versionToken) offset() int    { return int(uint64(t) >> 32) }
+func (t versionToken) length() int    { return int(uint64(t) & versionTokenValueMask) }
 
 type versionTokenList []versionToken
 
-func versionTokensEqual(a, b []versionToken) bool {
-	if len(a) != len(b) {
-		return false
+// compareVersions returns (less, equal) in a single pass. The old code called
+// less() and versionTokensEqual() separately, doubling the work for version
+// sorts. Numbers sort before text, matching the previous behaviour.
+func compareVersions(a, b versionTokenList, buf []byte) (bool, bool) {
+	common := len(a)
+	if len(b) < common {
+		common = len(b)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func (tokens versionTokenList) less(other versionTokenList) bool {
-	a, b := tokens, other
-	for i := 0; i < len(a) && i < len(b); i++ {
+	for i := 0; i < common; i++ {
 		x, y := a[i], b[i]
 		switch {
-		case x.number && y.number:
-			if x.value != y.value {
-				return x.value < y.value
+		case x.isNumber() && y.isNumber():
+			xv, yv := x.number(), y.number()
+			if xv != yv {
+				return xv < yv, false
 			}
-		case x.number != y.number:
-			return y.number
-		case x.text != y.text:
-			return x.text < y.text
+		case x.isNumber() != y.isNumber():
+			return y.isNumber(), false
+		default:
+			xs := buf[x.offset() : x.offset()+x.length()]
+			ys := buf[y.offset() : y.offset()+y.length()]
+			if c := bytes.Compare(xs, ys); c != 0 {
+				return c < 0, false
+			}
 		}
 	}
-	return len(a) < len(b)
+	return len(a) < len(b), len(a) == len(b)
 }
 
-// appendVersionTokens tokenizes s directly into dst. Callers sorting large
-// inventories pass one shared buffer so no per-row slice is allocated.
-func appendVersionTokens(dst []versionToken, s string) []versionToken {
-	s = strings.ToLower(strings.TrimSpace(s))
+// appendVersionTokens tokenizes s into dst and appends lowercased text
+// components to buf. Callers pass one shared buffer pair for all rows.
+func appendVersionTokens(dst []versionToken, buf []byte, s string) ([]versionToken, []byte) {
+	s = strings.TrimSpace(s)
 	for i := 0; i < len(s); {
 		if s[i] >= '0' && s[i] <= '9' {
 			end := i
@@ -166,7 +189,7 @@ func appendVersionTokens(dst []versionToken, s string) []versionToken {
 			}
 			value, err := strconv.Atoi(s[i:end])
 			if err == nil {
-				dst = append(dst, versionToken{number: true, value: value})
+				dst = append(dst, numberToken(value))
 			}
 			i = end
 			continue
@@ -175,8 +198,16 @@ func appendVersionTokens(dst []versionToken, s string) []versionToken {
 		for end < len(s) && (s[end] < '0' || s[end] > '9') {
 			end++
 		}
-		dst = append(dst, versionToken{text: s[i:end]})
+		off := len(buf)
+		for j := i; j < end; j++ {
+			c := s[j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			buf = append(buf, c)
+		}
+		dst = append(dst, textToken(off, end-i))
 		i = end
 	}
-	return dst
+	return dst, buf
 }

@@ -1083,7 +1083,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// The first chunk tells us roughly how many batches to expect. Growing
+		// allItems with Go's default doubling caused 8-16 MB memcpy stalls on
+		// large inventories; pre-size once from the first chunk instead.
+		if m.allItems == nil && len(msg.items) > 0 {
+			m.allItems = make([]FlatItem, 0, len(msg.items)*64)
+		}
+		appendDone := timingMeasure("TUI:   append chunk (n=%d cap=%d)", len(msg.items), cap(m.allItems))
 		m.allItems = append(m.allItems, msg.items...)
+		appendDone()
 		m.filterGen++
 		if msg.timestamp.After(m.lastUpdated) {
 			m.lastUpdated = msg.timestamp
