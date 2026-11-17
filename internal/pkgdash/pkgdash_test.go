@@ -119,6 +119,24 @@ func TestExports(t *testing.T) {
 	}
 }
 
+func TestEndpoint(t *testing.T) {
+	url, err := Endpoint(" daemon.internal ", "secret", "/packages")
+	if err != nil || url != "https://daemon.internal:9876/packages" {
+		t.Fatalf("Endpoint = %q, %v", url, err)
+	}
+	url, err = Endpoint("http://[::1]:9000", "", "/packages")
+	if err != nil || url != "http://[::1]:9000/packages" {
+		t.Fatalf("IPv6 Endpoint = %q, %v", url, err)
+	}
+	if _, err := Endpoint("http://daemon.internal:9876", "secret", "/packages"); err == nil {
+		t.Fatal("expected PSK over HTTP to be rejected")
+	}
+	history, err := HistoryURL("daemon.internal", "", "host+1", "libstdc++6")
+	if err != nil || !strings.Contains(history, "host%2B1") || !strings.Contains(history, "libstdc%2B%2B6") {
+		t.Fatalf("HistoryURL = %q, %v", history, err)
+	}
+}
+
 func TestLoadClientConfigEnvironmentWins(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

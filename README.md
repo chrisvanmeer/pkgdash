@@ -94,6 +94,15 @@ sudo ./pkgdashd --uninstall
 * `--osv-url`: OSV API URL or internal mirror (default `https://api.osv.dev`).
 * `--osv-proxy`: Optional HTTP/HTTPS proxy URL for OSV requests.
 * `--osv-cache-ttl`: OSV cache TTL duration (e.g., `6h`, `12h`, `24h`, default `12h`).
+* `--tls-hosts`: Extra DNS names/IP addresses to include as SANs in the auto-generated certificate (comma-separated). `localhost`, `127.0.0.1`, `::1` and the machine hostname are always included.
+
+A PSK is only accepted when TLS is enabled: the daemon refuses to start with `--psk` over plain HTTP. The generated self-signed certificate (`<data-path>/cert.pem`) can be used as the CA file by clients:
+
+```bash
+export PKGDASH_CA_FILE=/var/lib/pkgdash_data/cert.pem
+```
+
+Add the DNS name or IP you connect to via `--tls-hosts` when generating the certificate (delete the old `cert.pem`/`key.pem` first to regenerate it).
 
 ### Environment Variables & Secure Systemd Configuration
 
@@ -107,6 +116,7 @@ When installing as a systemd service (`--install`), options (including sensitive
 | `PKGDASH_DATA_PATH`     | `--data-path`     | `/tmp/pkgdash`        |
 | `PKGDASH_PSK`           | `--psk`           | `""`                  |
 | `PKGDASH_TLS`           | `--tls`           | `false`               |
+| `PKGDASH_TLS_HOSTS`     | `--tls-hosts`     | `""`                  |
 | `PKGDASH_ENABLE_OSV`    | `--enable-osv`    | `false`               |
 | `PKGDASH_OSV_URL`       | `--osv-url`       | `https://api.osv.dev` |
 | `PKGDASH_OSV_PROXY`     | `--osv-proxy`     | `""`                  |
@@ -134,9 +144,12 @@ Configure target servers using environment variables or a configuration file.
 ```bash
 export PKGDASH_SERVERS="https://pkgdash.internal.domain:9876,192.168.1.50:9876"
 export PKGDASH_PSK="your-secret-key"
+export PKGDASH_CA_FILE="/path/to/cert.pem"   # trust the daemon's self-signed certificate
 
 ./pkgdash
 ```
+
+TLS certificates are verified by default; use `--ca-file` (env `PKGDASH_CA_FILE`) for a private CA. `--cert-file`/`--key-file` enable mutual TLS. `--tls-server-name` overrides SNI/verification when connecting by IP. Servers without a scheme default to `https://` on port `9876`; a PSK is never sent over `http://`. `--insecure-tls` (env `PKGDASH_TLS_INSECURE=true`) disables verification and is only intended for local testing.
 
 #### Configuration File
 
@@ -170,13 +183,16 @@ export PKGDASH_SERVERS="https://pkgdash.internal.domain:9876"
 export PKGDASH_PSK="your-secret-key"
 export PKGDASH_WEB_PORT=":8080"      # Optional, defaults to :8080
 export PKGDASH_MIN_SEVERITY="7.0"    # Optional, minimum CVSS score to display
+export PKGDASH_WEB_AUTH_PSK="browser-secret"  # Optional: require auth for the web UI
 
 # Run directly
 ./pkgdash-web
 
 # Or use CLI flags (overrides environment variables)
-./pkgdash-web -port 8080 -min-severity 7.0
+./pkgdash-web -port 8080 -min-severity 7.0 -auth-psk browser-secret
 ```
+
+When `PKGDASH_WEB_AUTH_PSK` is set, browsers get a Basic auth prompt and API clients can send `X-PSK`. Without it the web UI is publicly reachable — only expose it behind an authenticating reverse proxy. For HTTPS termination behind a trusted proxy, pass `--trust-proxy` (env `PKGDASH_TRUST_PROXY=true`) so `X-Forwarded-Proto: https` is honored. The daemon-facing TLS options (`--ca-file`, `--cert-file`, `--key-file`, `--tls-server-name`, `--insecure-tls`) behave the same as in the TUI.
 
 You can also define `web_port=8080` in `~/.local/pkgdash.config`.
 

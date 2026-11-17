@@ -2,7 +2,6 @@ package main
 
 import (
 	"compress/gzip"
-	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -318,8 +317,18 @@ type model struct {
 	hasOSV     bool
 }
 
+var (
+	apiClient         *http.Client
+	historyHTTPClient *http.Client
+)
+
 func main() {
 	flagMinSev := flag.Float64("min-severity", -1, "Minimum CVSS severity threshold to display vulnerabilities")
+	flagCAFile := flag.String("ca-file", "", "PEM file containing the CA that signed the daemon certificate")
+	flagCertFile := flag.String("cert-file", "", "Client certificate for mutual TLS")
+	flagKeyFile := flag.String("key-file", "", "Client key for mutual TLS")
+	flagServerName := flag.String("tls-server-name", "", "Override the TLS server name (SNI and verification)")
+	flagInsecure := flag.Bool("insecure-tls", false, "Disable TLS certificate verification (unsafe, use only for testing)")
 	flag.Parse()
 
 	servers, psk, minSev := getConfig()
@@ -330,6 +339,29 @@ func main() {
 	if len(servers) == 0 {
 		log.Fatal("No servers found. Set PKGDASH_SERVERS or configure ~/.local/pkgdash.config")
 	}
+
+	tlsOpts := pkgdash.TLSConfigFromEnv()
+	if *flagCAFile != "" {
+		tlsOpts.CAFile = *flagCAFile
+	}
+	if *flagCertFile != "" {
+		tlsOpts.CertFile = *flagCertFile
+	}
+	if *flagKeyFile != "" {
+		tlsOpts.KeyFile = *flagKeyFile
+	}
+	if *flagServerName != "" {
+		tlsOpts.ServerName = *flagServerName
+	}
+	if *flagInsecure {
+		tlsOpts.Insecure = true
+	}
+	tlsCfg, err := pkgdash.NewTLSConfig(tlsOpts)
+	if err != nil {
+		log.Fatalf("Invalid TLS configuration: %v", err)
+	}
+	apiClient = pkgdash.NewHTTPClient(15*time.Second, tlsCfg)
+	historyHTTPClient = pkgdash.NewHTTPClient(5*time.Second, tlsCfg)
 
 	hi := textinput.New()
 	hi.Placeholder = PlaceholderHost
@@ -362,11 +394,10 @@ func main() {
 
 	updateChan := make(chan dataMsg)
 
-	hasTLS := false
+	hasTLS := !tlsOpts.Insecure
 	for _, s := range servers {
-		if strings.HasPrefix(s, "https://") {
-			hasTLS = true
-			break
+		if strings.HasPrefix(strings.ToLower(s), "http://") {
+			hasTLS = false
 		}
 	}
 
@@ -413,31 +444,17 @@ func getConfig() ([]string, string, float64) {
 func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan chan dataMsg) {
 	var wg sync.WaitGroup
 
-	customTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	client := http.Client{
-		Timeout:   15 * time.Second,
-		Transport: customTransport,
-	}
-
 	for _, s := range servers {
 		wg.Add(1)
 		go func(server string) {
 			defer wg.Done()
-			url := server
-
-			if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-				url = "http://" + url
+			url, err := pkgdash.Endpoint(server, psk, "/packages")
+			if err != nil {
+				log.Printf("Cannot query %s: %v", server, err)
+				return
 			}
 
-			cleanURL := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
-			if !strings.Contains(cleanURL, ":") {
-				url += ":9876"
-			}
-			url += "/packages"
-
-			req, err := http.NewRequest("GET", url, nil)
+			req, err := http.NewRequest(http.MethodGet, url, nil)
 			if err != nil {
 				return
 			}
@@ -446,11 +463,14 @@ func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan 
 				req.Header.Set("X-PSK", psk)
 			}
 
-			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode == http.StatusUnauthorized {
+			resp, err := apiClient.Do(req)
+			if err != nil {
 				return
 			}
 			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
 
 			osvHeaderActive := strings.EqualFold(resp.Header.Get("X-OSV-Enabled"), "true")
 
@@ -529,38 +549,15 @@ func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan 
 func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string) tea.Cmd {
 	return func() tea.Msg {
 		var allEvents []ChangeEvent
-		customTransport := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-		client := http.Client{
-			Timeout:   5 * time.Second,
-			Transport: customTransport,
-		}
 
 		for _, s := range servers {
-			url := s
-			if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-				url = "http://" + url
+			url, err := pkgdash.HistoryURL(s, psk, hostname, pkgName)
+			if err != nil {
+				log.Printf("Cannot query history on %s: %v", s, err)
+				continue
 			}
 
-			cleanURL := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
-			if !strings.Contains(cleanURL, ":") {
-				url += ":9876"
-			}
-			url += "/history"
-
-			var params []string
-			if hostname != "" {
-				params = append(params, "host="+hostname)
-			}
-			if pkgName != "" {
-				params = append(params, "pkg="+pkgName)
-			}
-			if len(params) > 0 {
-				url += "?" + strings.Join(params, "&")
-			}
-
-			req, err := http.NewRequest("GET", url, nil)
+			req, err := http.NewRequest(http.MethodGet, url, nil)
 			if err != nil {
 				continue
 			}
@@ -568,8 +565,12 @@ func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string) tea
 				req.Header.Set("X-PSK", psk)
 			}
 
-			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode != http.StatusOK {
+			resp, err := historyHTTPClient.Do(req)
+			if err != nil {
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				_ = resp.Body.Close()
 				continue
 			}
 
@@ -580,6 +581,10 @@ func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string) tea
 			_ = resp.Body.Close()
 		}
 
+		// Multi-server histories must be globally chronological, not grouped by server.
+		sort.Slice(allEvents, func(i, j int) bool {
+			return allEvents[i].Timestamp.Before(allEvents[j].Timestamp)
+		})
 		return historyDataMsg{
 			events:    allEvents,
 			queryHost: hostname,
@@ -2283,8 +2288,13 @@ func (m model) View() string {
 	tBadge := titleBadge.Render(" 📦 PKGDASH ")
 
 	secStatus := " HTTP "
-	if m.hasTLS || m.hasPSK {
+	switch {
+	case m.hasTLS && m.hasPSK:
 		secStatus = " 🔒 SECURE "
+	case m.hasTLS:
+		secStatus = " 🔒 TLS "
+	case m.hasPSK:
+		secStatus = " 🔑 PSK "
 	}
 	sBadge := secBadge.Render(secStatus)
 

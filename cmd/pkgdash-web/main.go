@@ -2,18 +2,23 @@ package main
 
 import (
 	"compress/gzip"
-	"crypto/tls"
+	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"pkgdash-project/internal/pkgdash"
@@ -30,20 +35,35 @@ type (
 )
 
 var (
-	globalItems   []FlatItem
-	lastUpdated   time.Time
-	dataMutex     sync.RWMutex
-	serversConfig []string
-	pskConfig     string
-	webPort       string = ":8080"
-	hasOSVGlobal  bool
-	minSevConfig  float64 = 0.0
+	globalItems       []FlatItem
+	lastUpdated       time.Time
+	dataMutex         sync.RWMutex
+	serversConfig     []string
+	pskConfig         string
+	authPSK           string
+	trustProxy        bool
+	webPort           = ":8080"
+	hasOSVGlobal      bool
+	syncError         string
+	minSevConfig      = 0.0
+	apiClient         *http.Client
+	historyHTTPClient *http.Client
 )
 
 func main() {
 	flagMinSev := flag.Float64("min-severity", -1, "Minimum CVSS severity threshold to display vulnerabilities")
 	flagPort := flag.String("port", "", "Web server port")
+	flagAuthPSK := flag.String("auth-psk", os.Getenv("PKGDASH_WEB_AUTH_PSK"), "PSK required to access the web UI (Basic auth password or X-PSK header)")
+	flagCAFile := flag.String("ca-file", "", "PEM file containing the CA that signed the daemon certificate")
+	flagCertFile := flag.String("cert-file", "", "Client certificate for mutual TLS")
+	flagKeyFile := flag.String("key-file", "", "Client key for mutual TLS")
+	flagServerName := flag.String("tls-server-name", "", "Override the TLS server name (SNI and verification)")
+	flagInsecure := flag.Bool("insecure-tls", false, "Disable TLS certificate verification (unsafe, use only for testing)")
+	flagTrustProxy := flag.Bool("trust-proxy", getEnvBool("PKGDASH_TRUST_PROXY"), "Trust X-Forwarded-Proto from a reverse proxy")
 	flag.Parse()
+
+	authPSK = strings.TrimSpace(*flagAuthPSK)
+	trustProxy = *flagTrustProxy
 
 	cfg := pkgdash.LoadClientConfig()
 	serversConfig, pskConfig, minSevConfig = cfg.Servers, cfg.PSK, cfg.MinSeverity
@@ -64,6 +84,29 @@ func main() {
 		log.Fatal("No servers found. Set PKGDASH_SERVERS or configure ~/.local/pkgdash.config")
 	}
 
+	tlsOpts := pkgdash.TLSConfigFromEnv()
+	if *flagCAFile != "" {
+		tlsOpts.CAFile = *flagCAFile
+	}
+	if *flagCertFile != "" {
+		tlsOpts.CertFile = *flagCertFile
+	}
+	if *flagKeyFile != "" {
+		tlsOpts.KeyFile = *flagKeyFile
+	}
+	if *flagServerName != "" {
+		tlsOpts.ServerName = *flagServerName
+	}
+	if *flagInsecure {
+		tlsOpts.Insecure = true
+	}
+	tlsCfg, err := pkgdash.NewTLSConfig(tlsOpts)
+	if err != nil {
+		log.Fatalf("Invalid TLS configuration: %v", err)
+	}
+	apiClient = pkgdash.NewHTTPClient(15*time.Second, tlsCfg)
+	historyHTTPClient = pkgdash.NewHTTPClient(5*time.Second, tlsCfg)
+
 	// Start background data synchronization loop (polls backend every 15 seconds)
 	go func() {
 		for {
@@ -75,25 +118,87 @@ func main() {
 	// Brief initial pause to populate cache
 	time.Sleep(500 * time.Millisecond)
 
-	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/table", handleTable)
-	http.HandleFunc("/modal/host", handleHostModal)
-	http.HandleFunc("/modal/host/history", handleHostHistoryModal)
-	http.HandleFunc("/modal/package/history", handlePackageHistoryModal)
-	http.HandleFunc("/modal/timeline", handleTimelineModal)
-	http.HandleFunc("/modal/diff", handleDiffModal)
-	http.HandleFunc("/modal/osv", handleOSVModal)
-	http.HandleFunc("/diff/results", handleDiffResults)
-	http.HandleFunc("/export/csv", handleExportCSV)
-	http.HandleFunc("/export/ini", handleExportINI)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/table", handleTable)
+	mux.HandleFunc("/status", handleStatus)
+	mux.HandleFunc("/modal/host", handleHostModal)
+	mux.HandleFunc("/modal/host/history", handleHostHistoryModal)
+	mux.HandleFunc("/modal/package/history", handlePackageHistoryModal)
+	mux.HandleFunc("/modal/timeline", handleTimelineModal)
+	mux.HandleFunc("/modal/diff", handleDiffModal)
+	mux.HandleFunc("/modal/osv", handleOSVModal)
+	mux.HandleFunc("/diff/results", handleDiffResults)
+	mux.HandleFunc("/export/csv", handleExportCSV)
+	mux.HandleFunc("/export/ini", handleExportINI)
+
+	server := &http.Server{
+		Addr:              webPort,
+		Handler:           withSecurity(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
+	}()
 
 	minSevMsg := "all"
 	if minSevConfig > 0 {
 		minSevMsg = fmt.Sprintf(">= %.1f", minSevConfig)
 	}
+	authMsg := "without authentication (set PKGDASH_WEB_AUTH_PSK)"
+	if authPSK != "" {
+		authMsg = "with authentication"
+	}
 
-	fmt.Printf("🚀 Starting pkgdash-web on http://localhost%s (Min CVSS Severity: %s)\n", webPort, minSevMsg)
-	log.Fatal(http.ListenAndServe(webPort, nil))
+	fmt.Printf("🚀 Starting pkgdash-web on http://localhost%s (Min CVSS Severity: %s, %s)\n", webPort, minSevMsg, authMsg)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("Server error: %v", err)
+	}
+}
+
+func getEnvBool(name string) bool {
+	value, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(name)))
+	return value
+}
+
+// withSecurity adds inbound authentication and hardening headers to every
+// response. X-PSK is useful for API clients; Basic auth works in browsers.
+func withSecurity(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authPSK != "" && !authorized(r) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="pkgdash"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'")
+		if r.TLS != nil || (trustProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")) {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authorized(r *http.Request) bool {
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-PSK")), []byte(authPSK)) == 1 {
+		return true
+	}
+	_, password, ok := r.BasicAuth()
+	return ok && subtle.ConstantTimeCompare([]byte(password), []byte(authPSK)) == 1
 }
 
 func fetchAllData(servers []string, psk string) {
@@ -102,25 +207,19 @@ func fetchAllData(servers []string, psk string) {
 	var latestTime time.Time
 	var itemsMutex sync.Mutex
 	osvDetected := false
-
-	customTransport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	client := http.Client{Timeout: 15 * time.Second, Transport: customTransport}
+	successes := 0
 
 	for _, s := range servers {
 		wg.Add(1)
 		go func(server string) {
 			defer wg.Done()
-			url := server
-			if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-				url = "http://" + url
+			url, err := pkgdash.Endpoint(server, psk, "/packages")
+			if err != nil {
+				log.Printf("Cannot query %s: %v", server, err)
+				return
 			}
-			cleanURL := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
-			if !strings.Contains(cleanURL, ":") {
-				url += ":9876"
-			}
-			url += "/packages"
 
-			req, err := http.NewRequest("GET", url, nil)
+			req, err := http.NewRequest(http.MethodGet, url, nil)
 			if err != nil {
 				return
 			}
@@ -129,11 +228,14 @@ func fetchAllData(servers []string, psk string) {
 				req.Header.Set("X-PSK", psk)
 			}
 
-			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode != 200 {
+			resp, err := apiClient.Do(req)
+			if err != nil {
 				return
 			}
 			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
 
 			osvHeaderActive := strings.EqualFold(resp.Header.Get("X-OSV-Enabled"), "true")
 			if osvHeaderActive {
@@ -162,6 +264,9 @@ func fetchAllData(servers []string, psk string) {
 
 			var payload []HostPayload
 			if err := json.NewDecoder(reader).Decode(&payload); err == nil {
+				itemsMutex.Lock()
+				successes++
+				itemsMutex.Unlock()
 				var localItems []FlatItem
 				for _, host := range payload {
 					isOSV := osvHeaderActive || host.OSVEnabled
@@ -201,8 +306,9 @@ func fetchAllData(servers []string, psk string) {
 	}
 
 	wg.Wait()
-	if len(allItems) > 0 {
-		dataMutex.Lock()
+	dataMutex.Lock()
+	defer dataMutex.Unlock()
+	if successes > 0 {
 		globalItems = allItems
 		hasOSVGlobal = osvDetected
 		if !latestTime.IsZero() {
@@ -210,42 +316,27 @@ func fetchAllData(servers []string, psk string) {
 		} else {
 			lastUpdated = time.Now()
 		}
-		dataMutex.Unlock()
+		syncError = ""
+		return
 	}
+	syncError = fmt.Sprintf("No daemon responded (checked %d server(s))", len(servers))
 }
 
 func fetchHistoryFromDaemons(hostname, pkgName string) []ChangeEvent {
 	var allEvents []ChangeEvent
-	customTransport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	client := http.Client{Timeout: 5 * time.Second, Transport: customTransport}
 
 	dataMutex.RLock()
 	servers, psk := serversConfig, pskConfig
 	dataMutex.RUnlock()
 
 	for _, s := range servers {
-		url := s
-		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-			url = "http://" + url
-		}
-		cleanURL := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
-		if !strings.Contains(cleanURL, ":") {
-			url += ":9876"
-		}
-		url += "/history"
-
-		var params []string
-		if hostname != "" {
-			params = append(params, "host="+hostname)
-		}
-		if pkgName != "" {
-			params = append(params, "pkg="+pkgName)
-		}
-		if len(params) > 0 {
-			url += "?" + strings.Join(params, "&")
+		url, err := pkgdash.HistoryURL(s, psk, hostname, pkgName)
+		if err != nil {
+			log.Printf("Cannot query history on %s: %v", s, err)
+			continue
 		}
 
-		req, err := http.NewRequest("GET", url, nil)
+		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
 			continue
 		}
@@ -253,8 +344,12 @@ func fetchHistoryFromDaemons(hostname, pkgName string) []ChangeEvent {
 			req.Header.Set("X-PSK", psk)
 		}
 
-		resp, err := client.Do(req)
-		if err != nil || resp.StatusCode != 200 {
+		resp, err := historyHTTPClient.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
 			continue
 		}
 
@@ -280,21 +375,28 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isSecure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	isSecure := r.TLS != nil || (trustProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"))
 	secStatus := "🔓 HTTP"
-	if isSecure {
+	if isSecure && authPSK != "" {
 		secStatus = "🔒 SECURE"
+	} else if isSecure {
+		secStatus = "🔒 TLS (no auth)"
+	} else if authPSK != "" {
+		secStatus = "🔒 AUTH (no TLS)"
 	}
 
 	dataMutex.RLock()
 	hasOSV := hasOSVGlobal
+	updated := lastUpdated.Local().Format("15:04:00")
+	syncErr := syncError
 	dataMutex.RUnlock()
 
 	_ = tmpl.ExecuteTemplate(w, "index", map[string]interface{}{
-		"LastUpdated": lastUpdated.Local().Format("15:04:05"),
+		"LastUpdated": updated,
 		"SecStatus":   secStatus,
 		"HasOSV":      hasOSV,
 		"MinSev":      minSevConfig,
+		"SyncError":   syncErr,
 	})
 }
 
@@ -332,25 +434,35 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 	return filtered, len(hostMap), len(verMap), vulnCount
 }
 
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	dataMutex.RLock()
+	updated := lastUpdated.Local().Format("15:04:05")
+	syncErr := syncError
+	dataMutex.RUnlock()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if syncErr != "" {
+		_, _ = fmt.Fprintf(w, `Updated: <span id="last-updated">%s</span> <span class="badge bg-red">✗ %s</span>`, updated, template.HTMLEscapeString(syncErr))
+		return
+	}
+	_, _ = fmt.Fprintf(w, `Updated: <span id="last-updated">%s</span> <span class="badge bg-green" id="sync-badge">✓ SYNCED</span>`, updated)
+}
+
 func handleTable(w http.ResponseWriter, r *http.Request) {
 	filtered, hCount, vCount, vulnCount := filterAndSort(r)
 
-	pageStr := r.URL.Query().Get("page")
-	page := 1
-	if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
-		page = p
-	}
-
 	pageSize := 1000
+	maxPage := len(filtered)/pageSize + 1
+	page := 1
+	if p, err := strconv.ParseInt(r.URL.Query().Get("page"), 10, 64); err == nil && p > 0 {
+		page = int(min(p, int64(maxPage)))
+	}
 
 	start := (page - 1) * pageSize
-	end := start + pageSize
+	end := min(start+pageSize, len(filtered))
 
 	if start >= len(filtered) && len(filtered) > 0 {
+		_, _ = w.Write([]byte(`<tr><td colspan="6" class="text-center text-muted">No more records</td></tr>`))
 		return
-	}
-	if end > len(filtered) {
-		end = len(filtered)
 	}
 
 	var displayItems []FlatItem
@@ -625,7 +737,9 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <title>Pkgdash Web</title>
     <!-- Embedded SVG Favicon -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10/dist/htmx.min.js"
+            integrity="sha384-D1Kt99CQMDuVetoL1lrYwg5t+9QdHe7NLX/SoJYkXDFfX37iInKRy5xLSi8nO7UC"
+            crossorigin="anonymous"></script>
     <style>
         :root {
             --bg: #1e1e2e; --surface: #313244; --border: #45475A;
@@ -756,9 +870,9 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             <span class="badge bg-purple"> 📦 PKGDASH-WEB </span>
             <span class="badge bg-cyan"> {{.SecStatus}} </span>
             {{if .HasOSV}}<span class="badge bg-red">🛡 OSV{{if gt .MinSev 0.0}} (≥{{.MinSev}}){{end}}</span>{{end}}
-            <span class="badge bg-green"> ✓ SYNCED </span>
+            {{if .SyncError}}<span class="badge bg-red"> ✗ {{.SyncError}} </span>{{else}}<span class="badge bg-green" id="sync-badge"> ✓ SYNCED </span>{{end}}
         </div>
-        <div class="text-muted" style="font-style: italic;">
+        <div class="text-muted" style="font-style: italic;" hx-get="/status" hx-trigger="every 15s" hx-swap="innerHTML">
             Updated: <span id="last-updated">{{.LastUpdated}}</span>
         </div>
     </div>
@@ -788,7 +902,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     </form>
 
     <!-- Main Table Container -->
-    <div class="panel" id="table-container" hx-get="/table" hx-trigger="load">
+    <div class="panel" id="table-container" hx-get="/table" hx-trigger="load, every 15s" hx-include="#filter-form">
         <!-- Loaded via HTMX -->
     </div>
 
@@ -964,7 +1078,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     {{$hasOSV := .HasOSV}}
     {{range .Items}}
     {{$hasVuln := and $hasOSV .Vulnerabilities}}
-    <tr {{if $hasVuln}}class="vuln-row"{{end}} hx-get="/modal/host?h={{.Hostname}}&p={{.PkgName}}" hx-target="#host-dialog-content" onclick="document.getElementById('hostModal').showModal()">
+    <tr {{if $hasVuln}}class="vuln-row"{{end}} hx-get="/modal/host?h={{urlquery .Hostname}}&p={{urlquery .PkgName}}" hx-target="#host-dialog-content" onclick="document.getElementById('hostModal').showModal()">
         <td>  {{.Hostname}}</td>
         <td>{{osLabel .OSName .OSVersion}}</td>
         <td>{{.PkgName}}</td>
@@ -992,7 +1106,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     
     <div style="margin-bottom: 1.5rem; text-align: center;">
         <button type="button" class="tab-btn active" onclick="document.getElementById('tab-overview').style.display='block'; document.getElementById('tab-history').style.display='none'; this.classList.add('active'); this.nextElementSibling.classList.remove('active');">Overview</button>
-        <button type="button" class="tab-btn" hx-get="/modal/host/history?h={{.Host.Hostname}}" hx-target="#tab-history" onclick="document.getElementById('tab-overview').style.display='none'; document.getElementById('tab-history').style.display='block'; this.classList.add('active'); this.previousElementSibling.classList.remove('active');">Change History</button>
+        <button type="button" class="tab-btn" hx-get="/modal/host/history?h={{urlquery .Host.Hostname}}" hx-target="#tab-history" onclick="document.getElementById('tab-overview').style.display='none'; document.getElementById('tab-history').style.display='block'; this.classList.add('active'); this.previousElementSibling.classList.remove('active');">Change History</button>
     </div>
 
     <div id="tab-overview" style="margin-left: 2rem; line-height: 2;">
@@ -1002,14 +1116,14 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Host Function:</span> {{if .Host.HostFunction}}{{.Host.HostFunction}}{{else}}-{{end}}</div>
         <div>
             <span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Package:</span> {{.Host.PkgName}} {{.Host.Version}}
-            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/package/history?h={{.Host.Hostname}}&p={{.Host.PkgName}}" hx-target="#pkg-history-dialog-content" onclick="document.getElementById('packageHistoryModal').showModal();">[View Package Timeline]</button>
+            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/package/history?h={{urlquery .Host.Hostname}}&p={{urlquery .Host.PkgName}}" hx-target="#pkg-history-dialog-content" onclick="document.getElementById('packageHistoryModal').showModal();">[View Package Timeline]</button>
         </div>
         {{if .HasOSV}}
         <div>
             <span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Security/CVE:</span> 
             <span class="text-red">{{.VulnSummary}}</span>
             {{if .Host.Vulnerabilities}}
-            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/osv?h={{.Host.Hostname}}&p={{.Host.PkgName}}" hx-target="#osv-dialog-content" onclick="document.getElementById('osvModal').showModal();">[View OSV Advisory]</button>
+            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/osv?h={{urlquery .Host.Hostname}}&p={{urlquery .Host.PkgName}}" hx-target="#osv-dialog-content" onclick="document.getElementById('osvModal').showModal();">[View OSV Advisory]</button>
             {{end}}
         </div>
         {{end}}
@@ -1060,7 +1174,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         </thead>
         <tbody>
             {{range .Events}}
-            <tr hx-get="/modal/package/history?h={{$.Hostname}}&p={{.Package}}" hx-target="#pkg-history-dialog-content" onclick="document.getElementById('packageHistoryModal').showModal()">
+            <tr hx-get="/modal/package/history?h={{urlquery $.Hostname}}&p={{urlquery .Package}}" hx-target="#pkg-history-dialog-content" onclick="document.getElementById('packageHistoryModal').showModal()">
                 <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
                 <td>
                     {{if eq .Action "ADDED"}}<span class="badge bg-green">+ ADDED</span>

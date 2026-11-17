@@ -3,27 +3,33 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -45,6 +51,7 @@ const (
 var (
 	activeDataPath string
 	activePSK      string
+	activeTLSHosts []string
 	historyMgr     *HistoryManager
 	previousState  = make(map[string]map[string]string)
 
@@ -397,21 +404,21 @@ func fetchOSVVulnerabilityDetails(vulnID string) (osvVuln, error) {
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			time.Sleep(time.Duration((attempt+1)*300) * time.Millisecond)
 			lastErr = fmt.Errorf("rate limited (429)")
 			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("HTTP status %d", resp.StatusCode)
 			continue
 		}
 
 		var v osvVuln
 		err = json.NewDecoder(resp.Body).Decode(&v)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			lastErr = err
 			continue
@@ -492,6 +499,7 @@ func main() {
 	dataPathFlag := flag.String("data-path", getEnvOrDefault("PKGDASH_DATA_PATH", defaultDataPath), "Path to directory containing JSON files")
 	pskFlag := flag.String("psk", getEnvOrDefault("PKGDASH_PSK", ""), "Pre-shared key for authentication")
 	tlsFlag := flag.Bool("tls", getEnvBoolOrDefault("PKGDASH_TLS", false), "Enable TLS encryption")
+	tlsHostsFlag := flag.String("tls-hosts", getEnvOrDefault("PKGDASH_TLS_HOSTS", ""), "Comma-separated DNS names/IPs to include in generated TLS certificate (SANs)")
 
 	osvEnableFlag := flag.Bool("enable-osv", getEnvBoolOrDefault("PKGDASH_ENABLE_OSV", defaultOSVEnable), "Enable OSV.dev vulnerability checking")
 	osvURLFlag := flag.String("osv-url", getEnvOrDefault("PKGDASH_OSV_URL", defaultOSVURL), "OSV API URL")
@@ -501,7 +509,16 @@ func main() {
 	flag.Parse()
 
 	activeDataPath = *dataPathFlag
-	activePSK = *pskFlag
+	activePSK = strings.TrimSpace(*pskFlag)
+	for _, host := range strings.Split(*tlsHostsFlag, ",") {
+		if host = strings.TrimSpace(host); host != "" {
+			activeTLSHosts = append(activeTLSHosts, host)
+		}
+	}
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		activeTLSHosts = append(activeTLSHosts, hostname)
+	}
+	activeTLSHosts = append(activeTLSHosts, "localhost", "127.0.0.1", "::1")
 	activeOSVEnabled = *osvEnableFlag
 	activeOSVURL = strings.TrimRight(*osvURLFlag, "/")
 	activeOSVProxy = *osvProxyFlag
@@ -527,6 +544,10 @@ func main() {
 		return
 	}
 
+	if activePSK != "" && !*tlsFlag {
+		log.Fatal("Refusing to start: --psk requires --tls (a PSK sent over plaintext HTTP can be intercepted)")
+	}
+
 	if activeOSVEnabled {
 		initOSVHTTPClient()
 		loadOSVCacheFromDisk()
@@ -539,23 +560,43 @@ func main() {
 
 	go startBackgroundSync(syncInterval)
 
-	http.HandleFunc("/packages", handlePackages)
-	http.HandleFunc("/history", handleHistory)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/packages", handlePackages)
+	mux.HandleFunc("/history", handleHistory)
+	server := &http.Server{
+		Addr:              *portFlag,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Printf("Starting pkgdashd listener on port %s, serving data from %s...", *portFlag, activeDataPath)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
+	}()
+
+	var err error
 	if *tlsFlag {
 		certPath := filepath.Join(activeDataPath, "cert.pem")
 		keyPath := filepath.Join(activeDataPath, "key.pem")
-		if err := ensureTLSCerts(certPath, keyPath); err != nil {
+		if err = ensureTLSCerts(certPath, keyPath); err != nil {
 			log.Fatalf("Failed to generate TLS certificates: %v", err)
 		}
-		if err := http.ListenAndServeTLS(*portFlag, certPath, keyPath, nil); err != nil {
-			log.Fatalf("Server error (TLS): %v", err)
-		}
+		err = server.ListenAndServeTLS(certPath, keyPath)
 	} else {
-		if err := http.ListenAndServe(*portFlag, nil); err != nil {
-			log.Fatalf("Server error: %v", err)
-		}
+		err = server.ListenAndServe()
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("Server error: %v", err)
 	}
 }
 
@@ -821,14 +862,14 @@ func fetchOSVBatch(pkgs []pkgKey, hosts []HostPayload, newestTime time.Time) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			log.Printf("OSV query returned status %d", resp.StatusCode)
 			continue
 		}
 
 		var batchResp osvBatchResponse
 		err = json.NewDecoder(resp.Body).Decode(&batchResp)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			log.Printf("OSV response decoding failed: %v", err)
 			continue
@@ -917,12 +958,14 @@ func fetchOSVBatch(pkgs []pkgKey, hosts []HostPayload, newestTime time.Time) {
 	log.Printf("OSV severity enrichment complete: payload and cache updated with CVSS scores.")
 }
 
+func validPSK(provided, expected string) bool {
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
 func handlePackages(w http.ResponseWriter, r *http.Request) {
-	if activePSK != "" {
-		if r.Header.Get("X-PSK") != activePSK {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if activePSK != "" && !validPSK(r.Header.Get("X-PSK"), activePSK) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 
 	cacheMu.RLock()
@@ -952,11 +995,9 @@ func handlePackages(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleHistory(w http.ResponseWriter, r *http.Request) {
-	if activePSK != "" {
-		if r.Header.Get("X-PSK") != activePSK {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if activePSK != "" && !validPSK(r.Header.Get("X-PSK"), activePSK) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 
 	hostname := r.URL.Query().Get("host")
@@ -980,13 +1021,39 @@ func ensureTLSCerts(certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 62))
+	if err != nil {
+		return err
+	}
+
+	var dnsNames []string
+	var ipAddresses []net.IP
+	seen := make(map[string]bool)
+	for _, host := range activeTLSHosts {
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+		if ip := net.ParseIP(host); ip != nil {
+			ipAddresses = append(ipAddresses, ip)
+		} else {
+			dnsNames = append(dnsNames, host)
+		}
+	}
+	commonName := "pkgdashd"
+	if len(dnsNames) > 0 {
+		commonName = dnsNames[0]
+	}
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{Organization: []string{"pkgdash Auto-TLS"}},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(3650 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: commonName, Organization: []string{"pkgdash Auto-TLS"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(3650 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              dnsNames,
+		IPAddresses:           ipAddresses,
 	}
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
@@ -997,8 +1064,13 @@ func ensureTLSCerts(certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	_ = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	_ = certOut.Close()
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
+		_ = certOut.Close()
+		return err
+	}
+	if err := certOut.Close(); err != nil {
+		return err
+	}
 
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
@@ -1009,10 +1081,11 @@ func ensureTLSCerts(certPath, keyPath string) error {
 		_ = keyOut.Close()
 		return err
 	}
-	_ = pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
-	_ = keyOut.Close()
-
-	return nil
+	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
+		_ = keyOut.Close()
+		return err
+	}
+	return keyOut.Close()
 }
 
 func copyFile(src, dst string) error {
