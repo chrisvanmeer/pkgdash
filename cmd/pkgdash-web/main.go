@@ -84,7 +84,7 @@ func main() {
 		log.Fatal("No servers found. Set PKGDASH_SERVERS or configure ~/.local/pkgdash.config")
 	}
 
-	tlsOpts := pkgdash.TLSConfigFromEnv()
+	tlsOpts := cfg.TLS
 	if *flagCAFile != "" {
 		tlsOpts.CAFile = *flagCAFile
 	}

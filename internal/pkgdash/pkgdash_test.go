@@ -137,33 +137,119 @@ func TestEndpoint(t *testing.T) {
 	}
 }
 
-func TestLoadClientConfigEnvironmentWins(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("PKGDASH_SERVERS", " https://env.example:9876 , https://second.example ")
-	t.Setenv("PKGDASH_PSK", " env-psk ")
-	t.Setenv("PKGDASH_WEB_PORT", "9090")
-
-	configDir := filepath.Join(home, ".local")
+func writeTestConfig(t *testing.T, content string) {
+	t.Helper()
+	configDir := filepath.Join(os.Getenv("HOME"), ".local")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	content := "# config\nhttps://file.example\npsk = file-psk\nmin_severity=7.0\nweb_port=:7070\n"
 	if err := os.WriteFile(filepath.Join(configDir, "pkgdash.config"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func clearClientEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"PKGDASH_SERVERS", "PKGDASH_PSK", "PKGDASH_MIN_SEVERITY", "PKGDASH_WEB_PORT",
+		"PKGDASH_TLS_INSECURE", "PKGDASH_CA_FILE", "PKGDASH_CERT_FILE",
+		"PKGDASH_KEY_FILE", "PKGDASH_TLS_SERVER_NAME",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+func TestLoadClientConfigINI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearClientEnv(t)
+	writeTestConfig(t, `# daemon details
+[server]
+servers = https://one.example:9876, https://two.example:9876
+psk = file-psk
+
+[client]
+tls_insecure = true
+ca_file = /tmp/ca.pem
+cert_file = /tmp/client.pem
+key_file = /tmp/client.key
+tls_server_name = daemon.example
+min_severity = 6.5
+web_port = :7070
+
+[unused]
+psk = ignored
+`)
 
 	cfg := LoadClientConfig()
-	if len(cfg.Servers) != 2 || cfg.Servers[0] != "https://env.example:9876" {
+	if len(cfg.Servers) != 2 || cfg.Servers[0] != "https://one.example:9876" || cfg.Servers[1] != "https://two.example:9876" {
 		t.Fatalf("servers = %+v", cfg.Servers)
 	}
-	if cfg.PSK != "env-psk" {
+	if cfg.PSK != "file-psk" {
 		t.Fatalf("psk = %q", cfg.PSK)
 	}
-	if cfg.MinSeverity != 7.0 {
-		t.Fatalf("min severity = %v", cfg.MinSeverity)
+	if cfg.MinSeverity != 6.5 || cfg.WebPort != ":7070" {
+		t.Fatalf("min severity = %v, web port = %q", cfg.MinSeverity, cfg.WebPort)
 	}
-	if cfg.WebPort != ":9090" {
-		t.Fatalf("web port = %q", cfg.WebPort)
+	if !cfg.TLS.Insecure {
+		t.Fatal("tls_insecure from [client] was ignored")
+	}
+	if cfg.TLS.CAFile != "/tmp/ca.pem" || cfg.TLS.CertFile != "/tmp/client.pem" ||
+		cfg.TLS.KeyFile != "/tmp/client.key" || cfg.TLS.ServerName != "daemon.example" {
+		t.Fatalf("tls = %+v", cfg.TLS)
+	}
+
+	tlsCfg, err := NewTLSConfig(cfg.TLS)
+	if err != nil || !tlsCfg.InsecureSkipVerify {
+		t.Fatalf("TLS config from file = %+v, %v", tlsCfg, err)
+	}
+}
+
+func TestLoadClientConfigEnvironmentWinsOverINI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearClientEnv(t)
+	t.Setenv("PKGDASH_SERVERS", " https://env.example:9876 ")
+	t.Setenv("PKGDASH_PSK", " env-psk ")
+	t.Setenv("PKGDASH_WEB_PORT", "9090")
+	t.Setenv("PKGDASH_TLS_INSECURE", "false")
+	t.Setenv("PKGDASH_CA_FILE", "/env/ca.pem")
+	writeTestConfig(t, `[server]
+servers = https://file.example:9876
+psk = file-psk
+
+[client]
+tls_insecure = true
+ca_file = /file/ca.pem
+web_port = :7070
+`)
+
+	cfg := LoadClientConfig()
+	if len(cfg.Servers) != 1 || cfg.Servers[0] != "https://env.example:9876" {
+		t.Fatalf("servers = %+v", cfg.Servers)
+	}
+	if cfg.PSK != "env-psk" || cfg.WebPort != ":9090" {
+		t.Fatalf("psk = %q, web port = %q", cfg.PSK, cfg.WebPort)
+	}
+	if cfg.TLS.Insecure || cfg.TLS.CAFile != "/env/ca.pem" {
+		t.Fatalf("env TLS settings did not win: %+v", cfg.TLS)
+	}
+}
+
+func TestLoadClientConfigLegacyFlatFormat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearClientEnv(t)
+	writeTestConfig(t, `# old style, no sections
+https://legacy.example:9876
+psk = legacy-psk
+min_severity = 7.0
+web_port = :7070
+tls_insecure = true
+`)
+
+	cfg := LoadClientConfig()
+	if len(cfg.Servers) != 1 || cfg.Servers[0] != "https://legacy.example:9876" {
+		t.Fatalf("servers = %+v", cfg.Servers)
+	}
+	if cfg.PSK != "legacy-psk" || cfg.MinSeverity != 7.0 || cfg.WebPort != ":7070" || !cfg.TLS.Insecure {
+		t.Fatalf("legacy settings lost: %+v", cfg)
 	}
 }

@@ -151,20 +151,34 @@ export PKGDASH_CA_FILE="/path/to/cert.pem"   # trust the daemon's self-signed ce
 ./pkgdash
 ```
 
-TLS certificates are verified by default; use `--ca-file` (env `PKGDASH_CA_FILE`) for a private CA. `--cert-file`/`--key-file` enable mutual TLS. `--tls-server-name` overrides SNI/verification when connecting by IP. Servers without a scheme default to `https://` on port `9876`; a PSK is never sent over `http://`. `--insecure-tls` (env `PKGDASH_TLS_INSECURE=true`) disables verification and is only intended for local testing.
+TLS certificates are verified by default; use `--ca-file` (env `PKGDASH_CA_FILE`) for a private CA. `--cert-file`/`--key-file` enable mutual TLS. `--tls-server-name` overrides SNI/verification when connecting by IP. Servers without a scheme default to `https://` on port `9876`; a PSK is never sent over `http://`. `--insecure-tls` (env `PKGDASH_TLS_INSECURE=true`) disables verification and is only intended for local testing. These TLS options can also be set in the `[client]` section of the config file (see below).
 
 #### Configuration File
 
-Alternatively, create `~/.local/pkgdash.config`:
+Alternatively, create `~/.local/pkgdash.config` in INI format:
 
 ```ini
-# Servers to query
-https://pkgdash.internal.domain:9876
-192.168.1.50:9876
+[server]
+# Comma-separated daemon addresses (an address without a scheme defaults to https:// on port 9876)
+servers = https://pkgdash.internal.domain:9876, 192.168.1.50:9876
+# Pre-Shared Key used to talk to the daemons
+psk = your-secret-key
 
-# Pre-Shared Key
-psk=your-secret-key
+[client]
+# Verify TLS certificates by default; set to true only for local testing
+tls_insecure = false
+# Preferred: trust the daemon's self-signed certificate instead of disabling verification
+ca_file = /var/lib/pkgdash_data/cert.pem
+# cert_file = /path/to/client.pem
+# key_file = /path/to/client.key
+# tls_server_name = pkgdash.internal.domain
+min_severity = 0
+web_port = :8080
 ```
+
+Precedence is: command-line flag → environment variable → config file. Old flat
+files (bare address lines and untyped `psk`, `min_severity`, `web_port` keys)
+are still accepted, but the sectioned format is recommended.
 
 Then run simply:
 

@@ -345,7 +345,8 @@ func main() {
 	flagInsecure := flag.Bool("insecure-tls", false, "Disable TLS certificate verification (unsafe, use only for testing)")
 	flag.Parse()
 
-	servers, psk, minSev := getConfig()
+	cfg := pkgdash.LoadClientConfig()
+	servers, psk, minSev := cfg.Servers, cfg.PSK, cfg.MinSeverity
 	if *flagMinSev >= 0 {
 		minSev = *flagMinSev
 	}
@@ -354,7 +355,7 @@ func main() {
 		log.Fatal("No servers found. Set PKGDASH_SERVERS or configure ~/.local/pkgdash.config")
 	}
 
-	tlsOpts := pkgdash.TLSConfigFromEnv()
+	tlsOpts := cfg.TLS
 	if *flagCAFile != "" {
 		tlsOpts.CAFile = *flagCAFile
 	}
@@ -454,11 +455,6 @@ func main() {
 		fmt.Printf("Error running TUI: %v\n", err)
 	}
 	cancel()
-}
-
-func getConfig() ([]string, string, float64) {
-	cfg := pkgdash.LoadClientConfig()
-	return cfg.Servers, cfg.PSK, cfg.MinSeverity
 }
 
 func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev float64, updateChan chan dataMsg) {
