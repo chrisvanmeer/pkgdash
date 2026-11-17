@@ -411,11 +411,13 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 	defer dataMutex.RUnlock()
 
 	hostQuery := strings.TrimSpace(r.URL.Query().Get("host"))
+	osQuery := strings.TrimSpace(r.URL.Query().Get("os"))
 	pkgQuery := strings.TrimSpace(r.URL.Query().Get("pkg"))
 	verQuery := strings.TrimSpace(r.URL.Query().Get("ver"))
 	vulnOnly := r.URL.Query().Get("vulnOnly") == "true"
 
 	hMatch := createFieldMatcher(hostQuery)
+	oMatch := createFieldMatcher(osQuery)
 	pMatch := createFieldMatcher(pkgQuery)
 	vMatch := createFieldMatcher(verQuery)
 
@@ -428,7 +430,7 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 		if vulnOnly && len(item.Vulnerabilities) == 0 {
 			continue
 		}
-		if hMatch(item.Hostname) && pMatch(item.PkgName) && vMatch(item.Version) {
+		if hMatch(item.Hostname) && oMatch(osLabel(item.OSName, item.OSVersion)) && pMatch(item.PkgName) && vMatch(item.Version) {
 			filtered = append(filtered, item)
 			hostMap[item.Hostname] = true
 			verMap[item.Version] = true
@@ -998,6 +1000,10 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         <div class="filter-card">
             <div class="f-label"><span>HOST</span> <span class="indicator">[TXT]</span></div>
             <div class="f-input-wrapper">❯ <input type="text" name="host" placeholder="Filter hostname..." autofocus hx-get="/table" hx-target="#table-container" hx-include="#filter-form" hx-trigger="keyup changed delay:250ms"></div>
+        </div>
+        <div class="filter-card">
+            <div class="f-label"><span>OS</span> <span class="indicator">[TXT]</span></div>
+            <div class="f-input-wrapper">❯ <input type="text" name="os" placeholder="Filter OS..." hx-get="/table" hx-target="#table-container" hx-include="#filter-form" hx-trigger="keyup changed delay:250ms"></div>
         </div>
         <div class="filter-card">
             <div class="f-label"><span>PACKAGE</span> <span class="indicator">[TXT]</span></div>
