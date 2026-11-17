@@ -1017,7 +1017,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastUpdated = msg.timestamp
 		}
 
-		m.filterItems()
+		// Filter only the newly arrived chunk. Before this, every chunk
+		// re-filtered the entire inventory, which became O(N²) for large
+		// inventories with an active search query.
+		if m.hostInput.Value() == "" && m.osInput.Value() == "" &&
+			m.pkgInput.Value() == "" && m.verInput.Value() == "" && !m.showOnlyVulns {
+			m.filtered = m.allItems
+		} else {
+			m.filtered = pkgdash.FilterAppend(
+				m.filtered,
+				msg.items,
+				m.hostInput.Value(),
+				m.osInput.Value(),
+				m.pkgInput.Value(),
+				m.verInput.Value(),
+				m.showOnlyVulns,
+			)
+		}
 		m.updateViewport()
 
 		return m, waitForUpdate(m.updateChan)

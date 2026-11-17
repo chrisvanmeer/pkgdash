@@ -37,6 +37,32 @@ func BenchmarkFilterWithQuery(b *testing.B) {
 	}
 }
 
+// BenchmarkFilterMatchAll exercises the matcher on every row: the query
+// matches all hostnames, so no short-circuiting happens in the filter loop.
+func BenchmarkFilterMatchAll(b *testing.B) {
+	items := benchItems(100000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = Filter(items, "host", "", "", "", false)
+	}
+}
+
+func BenchmarkMatcherPlain(b *testing.B) {
+	match := NewMatcher("host-123.example.com")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = match("HOST-123.EXAMPLE.COM")
+	}
+}
+
+func BenchmarkMatcherRegex(b *testing.B) {
+	match := NewMatcher("^host-0[13].*example")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = match("host-01.example.com")
+	}
+}
+
 func BenchmarkSortHost(b *testing.B) {
 	base := benchItems(100000)
 	b.ResetTimer()

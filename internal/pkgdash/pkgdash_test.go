@@ -76,6 +76,46 @@ func TestFilterNoQueryReturnsOriginal(t *testing.T) {
 	}
 }
 
+func TestFilterAppendMatchesFullFilter(t *testing.T) {
+	all := []FlatItem{
+		{Hostname: "web-01", OSName: "Ubuntu", OSVersion: "24.04", PkgName: "nginx", Version: "1.25"},
+		{Hostname: "db-01", OSName: "Debian", OSVersion: "12", PkgName: "postgres", Version: "16.2"},
+		{Hostname: "web-02", OSName: "Ubuntu", OSVersion: "24.04", PkgName: "curl", Version: "8.6", Vulnerabilities: []Vulnerability{{ID: "CVE-1"}}},
+		{Hostname: "db-02", OSName: "Debian", OSVersion: "12", PkgName: "nginx", Version: "1.24"},
+	}
+
+	queries := []struct {
+		host, osName, pkg, ver string
+		vulnOnly               bool
+	}{
+		{"web", "", "", "", false},
+		{"", "ubuntu", "", "", false},
+		{"", "", "nginx", "", false},
+		{"", "", "", "1.2", false},
+		{"", "", "", "", true},
+		{"web", "ubuntu", "", "", false},
+	}
+
+	for _, q := range queries {
+		want := Filter(all, q.host, q.osName, q.pkg, q.ver, q.vulnOnly)
+
+		// Simulate two streaming chunks arriving one after the other.
+		var got []FlatItem
+		for _, chunk := range [][]FlatItem{all[:2], all[2:]} {
+			got = FilterAppend(got, chunk, q.host, q.osName, q.pkg, q.ver, q.vulnOnly)
+		}
+
+		if len(got) != len(want) {
+			t.Fatalf("FilterAppend(%q,%q,%q,%q,%v) = %d items, want %d", q.host, q.osName, q.pkg, q.ver, q.vulnOnly, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Hostname != want[i].Hostname || got[i].PkgName != want[i].PkgName {
+				t.Fatalf("item %d = %s/%s, want %s/%s", i, got[i].Hostname, got[i].PkgName, want[i].Hostname, want[i].PkgName)
+			}
+		}
+	}
+}
+
 func TestSortItemsFieldsAndDescending(t *testing.T) {
 	items := []FlatItem{
 		{Hostname: "b", OSName: "Zorin", OSVersion: "17", PkgName: "zeta", Version: "1.9"},
