@@ -53,6 +53,26 @@ func TestUpdateIgnoresStaleHistoryResponses(t *testing.T) {
 	}
 }
 
+func TestUpdateIgnoresStaleSortResults(t *testing.T) {
+	m := newTestModel()
+	m.sortRequestID = 2
+	m.allItems = []FlatItem{{Hostname: "b"}, {Hostname: "a"}}
+
+	stale := sortDoneMsg{requestID: 1, items: []FlatItem{{Hostname: "stale"}}}
+	updated, _ := m.Update(stale)
+	m = updated.(model)
+	if len(m.allItems) != 2 || m.allItems[0].Hostname != "b" {
+		t.Fatalf("stale sort result was applied: %+v", m.allItems)
+	}
+
+	fresh := sortDoneMsg{requestID: 2, items: []FlatItem{{Hostname: "fresh"}}}
+	updated, _ = m.Update(fresh)
+	m = updated.(model)
+	if len(m.allItems) != 1 || m.allItems[0].Hostname != "fresh" {
+		t.Fatalf("fresh sort result was not applied: %+v", m.allItems)
+	}
+}
+
 func TestRequestHistoryTagsAndTracksRequest(t *testing.T) {
 	m := newTestModel()
 	cmd := m.requestHistory("host-a", "libssl")

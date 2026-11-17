@@ -237,6 +237,11 @@ type dataMsg struct {
 	err       string
 }
 
+type sortDoneMsg struct {
+	requestID uint64
+	items     []FlatItem
+}
+
 type historyDataMsg struct {
 	requestID uint64
 	events    []ChangeEvent
@@ -258,6 +263,7 @@ type model struct {
 	allItems      []FlatItem
 	filtered      []FlatItem
 	filterGen     uint64 // bumped whenever filtered is replaced or extended
+	sortRequestID uint64
 	insightsPkg   string
 	insightsGen   uint64
 	insightsText  string
@@ -798,10 +804,27 @@ func (m *model) switchFocus(target int) {
 }
 
 func (m *model) sortData() {
+	m.sortRequestID++
 	defer timingMeasure("TUI: sortData (%d items)", len(m.allItems))()
 	fields := []pkgdash.SortField{pkgdash.SortHost, pkgdash.SortOS, pkgdash.SortPkg, pkgdash.SortVer}
 	pkgdash.SortItems(m.allItems, fields[m.sortCol], m.sortDesc)
 	m.filterItems()
+}
+
+// startInitialSort runs the final sort off the event loop so the TUI becomes
+// interactive immediately after loading. The request ID ensures a late result
+// is ignored if the user already changed the sort column meanwhile.
+func (m *model) startInitialSort() tea.Cmd {
+	m.sortRequestID++
+	id := m.sortRequestID
+	rows := append([]FlatItem(nil), m.allItems...)
+	fields := []pkgdash.SortField{pkgdash.SortHost, pkgdash.SortOS, pkgdash.SortPkg, pkgdash.SortVer}
+	field, descending := fields[m.sortCol], m.sortDesc
+	return func() tea.Msg {
+		defer timingMeasure("async initial sort (%d items)", len(rows))()
+		pkgdash.SortItems(rows, field, descending)
+		return sortDoneMsg{requestID: id, items: rows}
+	}
 }
 
 func (m *model) updateViewport() {
@@ -1073,14 +1096,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.isDone {
 			m.loaded = true
 			m.updateSyncError()
-			m.sortData()
+			// Show the data immediately; sort it off the event loop so a
+			// 200 ms sort cannot freeze input right after load.
+			m.filtered = m.allItems
 			m.updateViewport()
-			var gcStats debug.GCStats
-			debug.ReadGCStats(&gcStats)
-			timingLog("after load: %d GCs, total GC pause %s",
-				gcStats.NumGC, gcStats.PauseTotal.Truncate(time.Millisecond))
-			debug.SetGCPercent(originalGCPercent)
-			return m, nil
+			return m, m.startInitialSort()
 		}
 
 		// The first chunk tells us roughly how many batches to expect. Growing
@@ -1117,6 +1137,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewport()
 
 		return m, waitForUpdate(m.updateChan)
+
+	case sortDoneMsg:
+		if msg.requestID != m.sortRequestID {
+			return m, nil
+		}
+		m.allItems = msg.items
+		m.filterGen++
+		m.filterItems()
+		m.updateViewport()
+		var gcStats debug.GCStats
+		debug.ReadGCStats(&gcStats)
+		timingLog("after load: %d GCs, total GC pause %s",
+			gcStats.NumGC, gcStats.PauseTotal.Truncate(time.Millisecond))
+		debug.SetGCPercent(originalGCPercent)
+		return m, nil
 
 	case historyDataMsg:
 		if msg.requestID != m.historyRequestID {
