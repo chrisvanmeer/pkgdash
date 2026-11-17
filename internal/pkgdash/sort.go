@@ -26,15 +26,18 @@ type sortKey struct {
 // SortItems sorts rows by the requested field. Ties are broken consistently by
 // hostname, package and version so both clients show the same order.
 func SortItems(items []FlatItem, field SortField, descending bool) {
-	// Compute the comparison keys once per row. Version tokens live in one
-	// shared buffer with offsets per row instead of a separate slice allocation
-	// for every item, which was the dominant cost for large inventories.
-	type row struct {
-		item FlatItem
-		key  sortKey
+	n := len(items)
+	if n < 2 {
+		return
 	}
-	rows := make([]row, len(items))
-	tokens := make([]versionToken, 0, len(items)*4)
+
+	// Sort a compact key array plus a permutation instead of copying whole
+	// FlatItem structs (with their vulnerability slices) into an intermediate
+	// array. That intermediate was ~125 MB of allocations for 185k rows right
+	// after loading, which triggered expensive GC pauses during the final sort.
+	keys := make([]sortKey, n)
+	perm := make([]int, n)
+	tokens := make([]versionToken, 0, n*4)
 	needOS := field == SortOS
 	for i, item := range items {
 		from := len(tokens)
@@ -48,7 +51,8 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 		if needOS {
 			key.os = strings.ToLower(OSLabel(item.OSName, item.OSVersion))
 		}
-		rows[i] = row{item: item, key: key}
+		keys[i] = key
+		perm[i] = i
 	}
 
 	version := func(k sortKey) versionTokenList {
@@ -58,9 +62,7 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 		return versionTokensEqual(version(a), version(b))
 	}
 
-	sort.Slice(rows, func(i, j int) bool {
-		a, b := rows[i].key, rows[j].key
-
+	less := func(a, b sortKey) bool {
 		var primaryLess, primaryEqual bool
 		switch field {
 		case SortOS:
@@ -87,9 +89,30 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 			return !primaryLess
 		}
 		return primaryLess
+	}
+
+	sort.Slice(perm, func(i, j int) bool {
+		return less(keys[perm[i]], keys[perm[j]])
 	})
-	for i, r := range rows {
-		items[i] = r.item
+
+	// Apply the permutation in place with cycle rotation: each item is moved
+	// at most once, without a second full-size temporary slice.
+	for i := 0; i < n; i++ {
+		if perm[i] == i {
+			continue
+		}
+		tmp := items[i]
+		j := i
+		for {
+			k := perm[j]
+			perm[j] = j // mark visited so outer loop skips this cycle
+			if k == i {
+				break
+			}
+			items[j] = items[k]
+			j = k
+		}
+		items[j] = tmp
 	}
 }
 

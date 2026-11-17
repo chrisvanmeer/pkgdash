@@ -186,6 +186,40 @@ func TestGetFleetInsightsSumsVulnerabilities(t *testing.T) {
 	}
 }
 
+func TestGetFleetInsightsCacheInvalidation(t *testing.T) {
+	m := newTestModel()
+	m.filtered = []FlatItem{
+		{Hostname: "a", PkgName: "nginx", Version: "1.0"},
+		{Hostname: "b", PkgName: "nginx", Version: "1.1"},
+	}
+	m.filterGen++
+
+	first := m.getFleetInsights()
+	if !strings.Contains(first, "2 host(s)") {
+		t.Fatalf("unexpected initial insights: %q", first)
+	}
+
+	// Same package + same generation must return the cached value.
+	m.insightsText = "SENTINEL"
+	if got := m.getFleetInsights(); got != "SENTINEL" {
+		t.Fatalf("cache not reused: %q", got)
+	}
+
+	// Changing the selected package must recompute.
+	m.insightsText = ""
+	m.filtered[0].PkgName = "other"
+	if got := m.getFleetInsights(); !strings.Contains(got, "'other'") {
+		t.Fatalf("package change not reflected: %q", got)
+	}
+
+	// New data (generation bump) must also recompute even for same package.
+	m.insightsText = "SENTINEL2"
+	m.filterGen++
+	if got := m.getFleetInsights(); got == "SENTINEL2" {
+		t.Fatal("generation bump did not invalidate cache")
+	}
+}
+
 func TestCycleIndexWrapsInBothDirections(t *testing.T) {
 	for _, tc := range []struct {
 		current   int

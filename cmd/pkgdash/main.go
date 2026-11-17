@@ -256,6 +256,10 @@ type model struct {
 
 	allItems      []FlatItem
 	filtered      []FlatItem
+	filterGen     uint64 // bumped whenever filtered is replaced or extended
+	insightsPkg   string
+	insightsGen   uint64
+	insightsText  string
 	lastUpdated   time.Time
 	width         int
 	height        int
@@ -410,9 +414,10 @@ func main() {
 	diffF.Placeholder = "Filter compared packages..."
 	diffF.Prompt = ""
 
-	// One message per daemon plus the final "done" marker. Buffering avoids
-	// blocking producers if the user quits before all servers responded.
-	updateChan := make(chan dataMsg, len(servers)+1)
+	// Batches of items are sent per daemon while streaming. A generous buffer
+	// lets producers keep decoding while the TUI event loop renders; a full
+	// channel must not stall network decoding (that cost 2.2s for 185k rows).
+	updateChan := make(chan dataMsg, 256)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -560,6 +565,26 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 			}
 
 			hostCount, itemCount := 0, 0
+			const batchSize = 4000
+			var batch []FlatItem
+			batchHasOSV := false
+			flushBatch := func() bool {
+				if len(batch) == 0 {
+					return true
+				}
+				if !send(dataMsg{
+					server:    server,
+					items:     batch,
+					timestamp: serverMaxTime,
+					hasOSV:    batchHasOSV,
+				}) {
+					return false
+				}
+				batch = nil
+				batchHasOSV = false
+				return true
+			}
+
 			for decoder.More() {
 				hostStart := time.Now()
 				var host HostPayload
@@ -574,7 +599,7 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 				itemCount += len(host.Packages)
 
 				isOSV := osvHeaderActive || host.OSVEnabled
-				var localItems []FlatItem
+				batchHasOSV = batchHasOSV || isOSV
 				for _, pkg := range host.Packages {
 					var filteredVulns []Vulnerability
 					for _, v := range pkg.Vulnerabilities {
@@ -582,7 +607,7 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 							filteredVulns = append(filteredVulns, v)
 						}
 					}
-					localItems = append(localItems, FlatItem{
+					batch = append(batch, FlatItem{
 						Hostname:        host.Hostname,
 						IPAddress:       host.IPAddress,
 						OSName:          host.OSName,
@@ -596,14 +621,12 @@ func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev
 					})
 				}
 
-				if !send(dataMsg{
-					server:    server,
-					items:     localItems,
-					timestamp: serverMaxTime,
-					hasOSV:    isOSV,
-				}) {
+				if len(batch) >= batchSize && !flushBatch() {
 					return
 				}
+			}
+			if !flushBatch() {
+				return
 			}
 			decodeDone()
 			timingLog("server %s: decoded %d hosts / %d packages", server, hostCount, itemCount)
@@ -1048,6 +1071,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.allItems = append(m.allItems, msg.items...)
+		m.filterGen++
 		if msg.timestamp.After(m.lastUpdated) {
 			m.lastUpdated = msg.timestamp
 		}
@@ -1615,6 +1639,7 @@ func (m *model) filterItems() {
 		m.verInput.Value(),
 		m.showOnlyVulns,
 	)
+	m.filterGen++
 }
 
 func createFieldMatcher(query string) func(string) bool {
@@ -1631,6 +1656,13 @@ func (m *model) getFleetInsights() string {
 	}
 
 	selectedPkg := m.filtered[m.cursor].PkgName
+	// This runs on every render. Scanning all rows with EqualFold was the
+	// dominant cost during streaming load (and on every keystroke). Cache the
+	// result until the filtered data or the selected package changes.
+	if m.insightsPkg == selectedPkg && m.insightsGen == m.filterGen {
+		return m.insightsText
+	}
+
 	hostMap := make(map[string]bool)
 	versionMap := make(map[string]bool)
 	vulnCount := 0
@@ -1654,8 +1686,11 @@ func (m *model) getFleetInsights() string {
 		vulnText = fmt.Sprintf(" ⚠️ %d Vulnerability/CVE(s) flagged across those hosts", vulnCount)
 	}
 
-	return fmt.Sprintf("📊 Fleet Insights%s: '%s' is present on %d host(s) across %d unique version(s)%s",
+	m.insightsPkg = selectedPkg
+	m.insightsGen = m.filterGen
+	m.insightsText = fmt.Sprintf("📊 Fleet Insights%s: '%s' is present on %d host(s) across %d unique version(s)%s",
 		filterTag, selectedPkg, len(hostMap), len(versionMap), vulnText)
+	return m.insightsText
 }
 
 func renderActionBadge(action string) string {
