@@ -18,6 +18,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -64,12 +65,17 @@ var (
 
 	// OSV Cache
 	osvCacheMu sync.RWMutex
-	osvCache   = make(map[string]osvCacheEntry)
-	isScanning bool
+	osvCache   = make(map[pkgKey]osvCacheEntry)
+
+	// Payload/scan coordination. All fields are guarded by scanMu.
+	scanMu          sync.Mutex
+	scanActive      bool
+	scanSequence    uint64
+	payloadSequence uint64
 
 	// Vulnerability Details Hydration Cache
 	vulnDetailsCacheMu sync.RWMutex
-	vulnDetailsCache   = make(map[string]osvVuln)
+	vulnDetailsCache   = make(map[string]osvDetailEntry)
 )
 
 type pkgKey struct {
@@ -82,6 +88,23 @@ type osvCacheEntry struct {
 	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
 	FetchedAt       time.Time       `json:"fetched_at"`
 }
+
+// osvCacheRecord is the on-disk representation. Go maps with struct keys cannot
+// be marshalled directly, so the cache is stored as a list of records.
+type osvCacheRecord struct {
+	Key   pkgKey        `json:"key"`
+	Entry osvCacheEntry `json:"entry"`
+}
+
+type osvDetailEntry struct {
+	Vuln      osvVuln
+	FetchedAt time.Time
+}
+
+const (
+	maxVulnDetailsCache = 2000
+	vulnDetailsTTL      = 7 * 24 * time.Hour
+)
 
 var (
 	cacheMu       sync.RWMutex
@@ -179,9 +202,10 @@ func getEnvBoolOrDefault(key string, defaultValue bool) bool {
 
 func getEnvDurationOrDefault(key string, defaultValue time.Duration) time.Duration {
 	if val := os.Getenv(key); val != "" {
-		if d, err := time.ParseDuration(val); err == nil {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
 			return d
 		}
+		log.Printf("Ignoring invalid %s=%q, using %s", key, val, defaultValue)
 	}
 	return defaultValue
 }
@@ -288,6 +312,9 @@ func parseCVSSScore(scoreStr string) float64 {
 	}
 
 	if val, err := strconv.ParseFloat(scoreStr, 64); err == nil {
+		if math.IsNaN(val) || math.IsInf(val, 0) || val < 0 || val > 10 {
+			return 0
+		}
 		return val
 	}
 
@@ -372,23 +399,28 @@ func extractHighestCVSSScore(v osvVuln) float64 {
 		} else if sevStr, ok := v.DatabaseSpecific["severity"].(string); ok {
 			maxScore = parseCVSSScore(sevStr)
 		} else if sevNum, ok := v.DatabaseSpecific["severity"].(float64); ok {
-			maxScore = sevNum
+			if !math.IsNaN(sevNum) && !math.IsInf(sevNum, 0) && sevNum >= 0 && sevNum <= 10 {
+				maxScore = sevNum
+			}
 		}
 	}
 
+	if math.IsNaN(maxScore) || math.IsInf(maxScore, 0) {
+		return 0
+	}
 	return maxScore
 }
 
 // fetchOSVVulnerabilityDetails retrieves full vulnerability payload by ID with rate-limit retry support.
 func fetchOSVVulnerabilityDetails(vulnID string) (osvVuln, error) {
 	vulnDetailsCacheMu.RLock()
-	if v, exists := vulnDetailsCache[vulnID]; exists {
+	if entry, exists := vulnDetailsCache[vulnID]; exists && time.Since(entry.FetchedAt) < vulnDetailsTTL {
 		vulnDetailsCacheMu.RUnlock()
-		return v, nil
+		return entry.Vuln, nil
 	}
 	vulnDetailsCacheMu.RUnlock()
 
-	endpoint := fmt.Sprintf("%s/v1/vulns/%s", activeOSVURL, vulnID)
+	endpoint := fmt.Sprintf("%s/v1/vulns/%s", activeOSVURL, url.PathEscape(vulnID))
 	maxRetries := 3
 	var lastErr error
 
@@ -425,7 +457,18 @@ func fetchOSVVulnerabilityDetails(vulnID string) (osvVuln, error) {
 		}
 
 		vulnDetailsCacheMu.Lock()
-		vulnDetailsCache[vulnID] = v
+		if len(vulnDetailsCache) >= maxVulnDetailsCache {
+			// Remove the oldest entries to keep memory bounded.
+			var oldestID string
+			var oldestTime time.Time
+			for id, cached := range vulnDetailsCache {
+				if oldestID == "" || cached.FetchedAt.Before(oldestTime) {
+					oldestID, oldestTime = id, cached.FetchedAt
+				}
+			}
+			delete(vulnDetailsCache, oldestID)
+		}
+		vulnDetailsCache[vulnID] = osvDetailEntry{Vuln: v, FetchedAt: time.Now()}
 		vulnDetailsCacheMu.Unlock()
 
 		return v, nil
@@ -443,7 +486,8 @@ func hydrateVulnerabilities(vulnIDs []string) {
 	for _, id := range vulnIDs {
 		if !seen[id] {
 			seen[id] = true
-			if _, exists := vulnDetailsCache[id]; !exists {
+			entry, exists := vulnDetailsCache[id]
+			if !exists || time.Since(entry.FetchedAt) >= vulnDetailsTTL {
 				uniqueIDs = append(uniqueIDs, id)
 			}
 		}
@@ -500,6 +544,7 @@ func main() {
 	pskFlag := flag.String("psk", getEnvOrDefault("PKGDASH_PSK", ""), "Pre-shared key for authentication")
 	tlsFlag := flag.Bool("tls", getEnvBoolOrDefault("PKGDASH_TLS", false), "Enable TLS encryption")
 	tlsHostsFlag := flag.String("tls-hosts", getEnvOrDefault("PKGDASH_TLS_HOSTS", ""), "Comma-separated DNS names/IPs to include in generated TLS certificate (SANs)")
+	serviceUserFlag := flag.String("service-user", getEnvOrDefault("PKGDASH_SERVICE_USER", ""), "User account used by the installed systemd service (empty means root)")
 
 	osvEnableFlag := flag.Bool("enable-osv", getEnvBoolOrDefault("PKGDASH_ENABLE_OSV", defaultOSVEnable), "Enable OSV.dev vulnerability checking")
 	osvURLFlag := flag.String("osv-url", getEnvOrDefault("PKGDASH_OSV_URL", defaultOSVURL), "OSV API URL")
@@ -529,7 +574,7 @@ func main() {
 	}
 
 	if *installFlag {
-		if err := installSystemdService(*portFlag, *dataPathFlag, *pskFlag, *tlsFlag, activeOSVEnabled, activeOSVURL, activeOSVProxy, activeOSVCacheTTL); err != nil {
+		if err := installSystemdService(*portFlag, *dataPathFlag, *pskFlag, *tlsFlag, *tlsHostsFlag, *serviceUserFlag, activeOSVEnabled, activeOSVURL, activeOSVProxy, activeOSVCacheTTL); err != nil {
 			log.Fatalf("Failed to install systemd service: %v", err)
 		}
 		fmt.Printf("Systemd service installed successfully.\nConfiguration written to %s (0600)\nListening on %s | Reading from %s\n", envFilePath, *portFlag, *dataPathFlag)
@@ -600,12 +645,13 @@ func main() {
 	}
 }
 
+var osVersionRegex = regexp.MustCompile(`\d+\.\d+`)
+
 func determineEcosystem(osName, osVersion string) string {
 	name := strings.ToLower(osName)
 
 	if strings.Contains(name, "ubuntu") {
-		re := regexp.MustCompile(`\d+\.\d+`)
-		if match := re.FindString(osVersion); match != "" {
+		if match := osVersionRegex.FindString(osVersion); match != "" {
 			return "Ubuntu:" + match
 		}
 		return "Ubuntu"
@@ -620,8 +666,7 @@ func determineEcosystem(osName, osVersion string) string {
 	}
 
 	if strings.Contains(name, "alpine") {
-		re := regexp.MustCompile(`\d+\.\d+`)
-		if match := re.FindString(osVersion); match != "" {
+		if match := osVersionRegex.FindString(osVersion); match != "" {
 			return "Alpine:v" + match
 		}
 		return "Alpine"
@@ -657,23 +702,67 @@ func loadOSVCacheFromDisk() {
 		return
 	}
 
+	var records []osvCacheRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		log.Printf("Ignoring unreadable OSV cache: %v", err)
+		return
+	}
+	loaded := make(map[pkgKey]osvCacheEntry, len(records))
+	for _, record := range records {
+		if record.Key.Name == "" {
+			continue
+		}
+		loaded[record.Key] = record.Entry
+	}
+
 	osvCacheMu.Lock()
-	defer osvCacheMu.Unlock()
-	_ = json.Unmarshal(data, &osvCache)
-	log.Printf("Loaded %d cached OSV package entries from disk", len(osvCache))
+	osvCache = loaded
+	osvCacheMu.Unlock()
+	log.Printf("Loaded %d cached OSV package entries from disk", len(loaded))
 }
 
 func saveOSVCacheToDisk() {
 	osvCacheMu.RLock()
-	defer osvCacheMu.RUnlock()
+	records := make([]osvCacheRecord, 0, len(osvCache))
+	for key, entry := range osvCache {
+		records = append(records, osvCacheRecord{Key: key, Entry: entry})
+	}
+	osvCacheMu.RUnlock()
 
-	data, err := json.Marshal(osvCache)
+	data, err := json.Marshal(records)
 	if err != nil {
+		log.Printf("Failed to encode OSV cache: %v", err)
 		return
 	}
 
+	if err := os.MkdirAll(activeDataPath, 0750); err != nil {
+		log.Printf("Failed to create data directory: %v", err)
+		return
+	}
 	cacheFile := filepath.Join(activeDataPath, "osv_cache.json")
-	_ = os.WriteFile(cacheFile, data, 0640)
+	tmpFile, err := os.CreateTemp(activeDataPath, ".osv_cache-*.tmp")
+	if err != nil {
+		log.Printf("Failed to create temporary OSV cache file: %v", err)
+		return
+	}
+	tmpName := tmpFile.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		log.Printf("Failed to write OSV cache: %v", err)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		log.Printf("Failed to close OSV cache file: %v", err)
+		return
+	}
+	if err := os.Chmod(tmpName, 0640); err != nil {
+		log.Printf("Failed to set OSV cache permissions: %v", err)
+		return
+	}
+	if err := os.Rename(tmpName, cacheFile); err != nil {
+		log.Printf("Failed to replace OSV cache file: %v", err)
+	}
 }
 
 func startBackgroundSync(interval time.Duration) {
@@ -689,14 +778,20 @@ func startBackgroundSync(interval time.Duration) {
 }
 
 func refreshCache(fetchOSV bool) {
+	if err := os.MkdirAll(activeDataPath, 0750); err != nil {
+		log.Printf("Cannot access data directory %s: %v", activeDataPath, err)
+		return
+	}
 	files, err := filepath.Glob(filepath.Join(activeDataPath, "*.json"))
 	if err != nil {
+		log.Printf("Cannot list data files: %v", err)
 		return
 	}
 
 	var newestTime time.Time
 	var allHosts []HostPayload
 	currentState := make(map[string]map[string]string)
+	readFailed := false
 
 	for _, file := range files {
 		if strings.HasSuffix(file, "history.json") || strings.HasSuffix(file, "history.jsonl") || strings.HasSuffix(file, "osv_cache.json") {
@@ -704,7 +799,12 @@ func refreshCache(fetchOSV bool) {
 		}
 
 		info, err := os.Stat(file)
-		if err != nil || info.Size() == 0 {
+		if err != nil {
+			log.Printf("Cannot stat %s: %v", file, err)
+			readFailed = true
+			continue
+		}
+		if info.Size() == 0 {
 			continue
 		}
 		if info.ModTime().After(newestTime) {
@@ -713,49 +813,90 @@ func refreshCache(fetchOSV bool) {
 
 		data, err := os.ReadFile(file)
 		if err != nil {
+			log.Printf("Cannot read %s (skipping this sync cycle): %v", file, err)
+			readFailed = true
 			continue
 		}
 
 		var hosts []HostPayload
-		if err := json.Unmarshal(data, &hosts); err == nil && len(hosts) > 0 {
-			for i := range hosts {
-				hosts[i].OSVEnabled = activeOSVEnabled
-				if currentState[hosts[i].Hostname] == nil {
-					currentState[hosts[i].Hostname] = make(map[string]string)
-				}
-				for _, pkg := range hosts[i].Packages {
-					currentState[hosts[i].Hostname][pkg.Name] = pkg.Version
-				}
-			}
-			allHosts = append(allHosts, hosts...)
+		if err := json.Unmarshal(data, &hosts); err != nil {
+			log.Printf("Cannot parse %s (skipping this sync cycle): %v", file, err)
+			readFailed = true
+			continue
 		}
+		if len(hosts) == 0 {
+			continue
+		}
+		for i := range hosts {
+			hosts[i].OSVEnabled = activeOSVEnabled
+			if currentState[hosts[i].Hostname] == nil {
+				currentState[hosts[i].Hostname] = make(map[string]string)
+			}
+			for _, pkg := range hosts[i].Packages {
+				currentState[hosts[i].Hostname][packageStateKey(pkg.Name, pkg.Arch)] = pkg.Version
+			}
+		}
+		allHosts = append(allHosts, hosts...)
 	}
 
+	// A transient read failure would otherwise look like package removals.
+	if readFailed {
+		log.Printf("Skipping history and payload update: one or more data files could not be read")
+		return
+	}
+
+	scanMu.Lock()
 	if historyMgr != nil && len(previousState) > 0 {
 		diffs := ComputeDiffs(previousState, currentState)
 		if len(diffs) > 0 {
 			historyMgr.RecordChanges(diffs)
 		}
 	}
-
 	previousState = currentState
+	payloadSequence++
+	currentPayloadSeq := payloadSequence
+	scanning := scanActive
+	if activeOSVEnabled && len(allHosts) > 0 && fetchOSV && !scanning {
+		scanActive = true
+		scanSequence++
+		scanSeq := scanSequence
+		scanMu.Unlock()
+		go func(hosts []HostPayload, modTime time.Time) {
+			defer func() {
+				scanMu.Lock()
+				scanActive = false
+				scanMu.Unlock()
+			}()
+			enrichWithOSV(hosts, modTime, scanSeq, currentPayloadSeq)
+		}(allHosts, newestTime)
+		return
+	}
+	scanMu.Unlock()
 
 	if activeOSVEnabled && len(allHosts) > 0 {
-		if fetchOSV && !isScanning {
-			go func(h []HostPayload) {
-				isScanning = true
-				defer func() { isScanning = false }()
-				enrichWithOSV(h, newestTime)
-			}(allHosts)
-		} else {
-			attachCachedOSV(allHosts)
-		}
+		attachCachedOSV(allHosts)
 	}
-
 	updatePayloadCache(allHosts, newestTime)
 }
 
+// publishOSVPayload only applies results from the active OSV scan. If files
+// changed or a newer scan started while this one ran, the stale result is
+// discarded instead of overwriting fresh data.
+func publishOSVPayload(hosts []HostPayload, newestTime time.Time, scanSeq, payloadSeq uint64) {
+	scanMu.Lock()
+	currentScan, currentPayload := scanSequence, payloadSequence
+	scanMu.Unlock()
+	if currentScan != scanSeq || currentPayload != payloadSeq {
+		log.Printf("Discarding stale OSV result (scan %d/%d, current %d/%d)", scanSeq, payloadSeq, currentScan, currentPayload)
+		return
+	}
+	updatePayloadCache(hosts, newestTime)
+}
+
 func updatePayloadCache(allHosts []HostPayload, newestTime time.Time) {
+	if allHosts == nil {
+		allHosts = []HostPayload{}
+	}
 	rawJSON, err := json.Marshal(allHosts)
 	if err != nil {
 		return
@@ -785,15 +926,19 @@ func attachCachedOSV(hosts []HostPayload) {
 		eco := determineEcosystem(hosts[i].OSName, hosts[i].OSVersion)
 		for j := range hosts[i].Packages {
 			p := &hosts[i].Packages[j]
-			key := p.Name + "@" + p.Version + "@" + eco
-			if entry, ok := osvCache[key]; ok && len(entry.Vulnerabilities) > 0 {
+			key := pkgKey{Name: p.Name, Version: p.Version, Ecosystem: eco}
+			entry, ok := osvCache[key]
+			if !ok || time.Since(entry.FetchedAt) > activeOSVCacheTTL {
+				continue
+			}
+			if len(entry.Vulnerabilities) > 0 {
 				p.Vulnerabilities = entry.Vulnerabilities
 			}
 		}
 	}
 }
 
-func enrichWithOSV(hosts []HostPayload, newestTime time.Time) {
+func enrichWithOSV(hosts []HostPayload, newestTime time.Time, scanSeq, payloadSeq uint64) {
 	uniquePkgs := make(map[pkgKey]bool)
 	for _, h := range hosts {
 		eco := determineEcosystem(h.OSName, h.OSVersion)
@@ -807,8 +952,7 @@ func enrichWithOSV(hosts []HostPayload, newestTime time.Time) {
 	var toFetch []pkgKey
 	osvCacheMu.RLock()
 	for pk := range uniquePkgs {
-		key := pk.Name + "@" + pk.Version + "@" + pk.Ecosystem
-		entry, exists := osvCache[key]
+		entry, exists := osvCache[pk]
 		if !exists || time.Since(entry.FetchedAt) > activeOSVCacheTTL {
 			toFetch = append(toFetch, pk)
 		}
@@ -817,133 +961,130 @@ func enrichWithOSV(hosts []HostPayload, newestTime time.Time) {
 
 	if len(toFetch) > 0 {
 		log.Printf("Querying OSV.dev API for %d packages (Cache TTL: %s)...", len(toFetch), activeOSVCacheTTL)
-		fetchOSVBatch(toFetch, hosts, newestTime)
+		fetchOSVBatch(toFetch, hosts, newestTime, scanSeq, payloadSeq)
 	} else {
 		attachCachedOSV(hosts)
-		updatePayloadCache(hosts, newestTime)
+		publishOSVPayload(hosts, newestTime, scanSeq, payloadSeq)
 	}
 }
 
-func fetchOSVBatch(pkgs []pkgKey, hosts []HostPayload, newestTime time.Time) {
+func fetchOSVBatch(pkgs []pkgKey, hosts []HostPayload, newestTime time.Time, scanSeq, payloadSeq uint64) {
 	vulnCount := 0
 	var idsToHydrate []string
-
-	osvCacheMu.Lock()
 	now := time.Now()
+	// Results are collected without holding the cache lock during network I/O.
+	updates := make(map[pkgKey]osvCacheEntry, len(pkgs))
 
 	for i := 0; i < len(pkgs); i += osvBatchSize {
-		end := i + osvBatchSize
-		if end > len(pkgs) {
-			end = len(pkgs)
-		}
+		end := min(i+osvBatchSize, len(pkgs))
 		chunk := pkgs[i:end]
 
 		reqBody := osvBatchRequest{Queries: make([]osvQuery, len(chunk))}
 		for idx, p := range chunk {
 			reqBody.Queries[idx] = osvQuery{
-				Package: osvPackage{
-					Name:      p.Name,
-					Ecosystem: p.Ecosystem,
-				},
+				Package: osvPackage{Name: p.Name, Ecosystem: p.Ecosystem},
 				Version: p.Version,
 			}
 		}
-
 		bodyBytes, err := json.Marshal(reqBody)
 		if err != nil {
 			continue
 		}
 
-		endpoint := fmt.Sprintf("%s/v1/querybatch", activeOSVURL)
-		resp, err := osvHTTPClient.Post(endpoint, "application/json", bytes.NewBuffer(bodyBytes))
-		if err != nil {
-			log.Printf("OSV query failed: %v", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			_ = resp.Body.Close()
-			log.Printf("OSV query returned status %d", resp.StatusCode)
-			continue
-		}
-
 		var batchResp osvBatchResponse
-		err = json.NewDecoder(resp.Body).Decode(&batchResp)
-		_ = resp.Body.Close()
-		if err != nil {
-			log.Printf("OSV response decoding failed: %v", err)
-			continue
-		}
-
-		for idx, res := range batchResp.Results {
-			if idx >= len(chunk) {
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			}
+			resp, err := osvHTTPClient.Post(activeOSVURL+"/v1/querybatch", "application/json", bytes.NewReader(bodyBytes))
+			if err != nil {
+				log.Printf("OSV query failed: %v", err)
+				continue
+			}
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+				_ = resp.Body.Close()
+				log.Printf("OSV query returned status %d, retrying", resp.StatusCode)
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				_ = resp.Body.Close()
+				log.Printf("OSV query returned status %d", resp.StatusCode)
 				break
 			}
-			p := chunk[idx]
-			key := p.Name + "@" + p.Version + "@" + p.Ecosystem
-
-			var vulns []Vulnerability
-			for _, minimalVuln := range res.Vulns {
-				idsToHydrate = append(idsToHydrate, minimalVuln.ID)
-				vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", minimalVuln.ID)
-
-				// Initialize default fields so they exist in JSON immediately
-				vulns = append(vulns, Vulnerability{
-					ID:       minimalVuln.ID,
-					Details:  "",
-					URL:      vulnURL,
-					Severity: 0.0,
-				})
+			err = json.NewDecoder(resp.Body).Decode(&batchResp)
+			_ = resp.Body.Close()
+			if err != nil {
+				log.Printf("OSV response decoding failed: %v", err)
+				continue
 			}
-
-			if len(vulns) > 0 {
+			for idx, res := range batchResp.Results {
+				if idx >= len(chunk) {
+					break
+				}
+				var vulns []Vulnerability
+				for _, minimalVuln := range res.Vulns {
+					idsToHydrate = append(idsToHydrate, minimalVuln.ID)
+					vulns = append(vulns, Vulnerability{
+						ID:      minimalVuln.ID,
+						URL:     "https://osv.dev/vulnerability/" + url.PathEscape(minimalVuln.ID),
+						Details: "",
+					})
+				}
 				vulnCount += len(vulns)
+				updates[chunk[idx]] = osvCacheEntry{Vulnerabilities: vulns, FetchedAt: now}
 			}
-
-			osvCache[key] = osvCacheEntry{
-				Vulnerabilities: vulns,
-				FetchedAt:       now,
+			// Successful responses also cache "no vulnerabilities" results.
+			for _, p := range chunk {
+				if _, ok := updates[p]; !ok {
+					updates[p] = osvCacheEntry{FetchedAt: now}
+				}
 			}
+			break
 		}
+	}
+
+	osvCacheMu.Lock()
+	for key, entry := range updates {
+		osvCache[key] = entry
 	}
 	osvCacheMu.Unlock()
 
-	// STEP 1: Immediately publish minimal data with default fields present in JSON
+	// STEP 1: Publish minimal data with all fields present in JSON.
 	attachCachedOSV(hosts)
 	saveOSVCacheToDisk()
-	updatePayloadCache(hosts, newestTime)
-	log.Printf("OSV initial scan complete: found %d vulnerabilities. Published initial payload with default fields.", vulnCount)
+	publishOSVPayload(hosts, newestTime, scanSeq, payloadSeq)
+	log.Printf("OSV initial scan complete: found %d vulnerabilities.", vulnCount)
 
 	if len(idsToHydrate) == 0 {
 		return
 	}
 
-	// STEP 2: Hydrate full details (CVSS scores) in the background
+	// STEP 2: Hydrate CVSS scores in the background.
 	hydrateVulnerabilities(idsToHydrate)
 
-	// STEP 3: Enrich the cache entries with fetched CVSS scores and overwrite the payload/file
+	// STEP 3: Enrich cache entries with the fetched scores.
 	osvCacheMu.Lock()
 	for key, entry := range osvCache {
 		updated := false
 		for idx, v := range entry.Vulnerabilities {
 			vulnDetailsCacheMu.RLock()
-			hydrated, ok := vulnDetailsCache[v.ID]
+			cached, ok := vulnDetailsCache[v.ID]
 			vulnDetailsCacheMu.RUnlock()
-
-			if ok {
-				vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", hydrated.ID)
-				for _, ref := range hydrated.References {
-					if (ref.Type == "ADVISORY" || ref.Type == "WEB") && strings.HasPrefix(ref.URL, "http") {
-						vulnURL = ref.URL
-						break
-					}
-				}
-
-				entry.Vulnerabilities[idx].Details = hydrated.Details
-				entry.Vulnerabilities[idx].URL = vulnURL
-				entry.Vulnerabilities[idx].Severity = extractHighestCVSSScore(hydrated)
-				updated = true
+			if !ok || time.Since(cached.FetchedAt) >= vulnDetailsTTL {
+				continue
 			}
+			hydrated := cached.Vuln
+			vulnURL := fmt.Sprintf("https://osv.dev/vulnerability/%s", url.PathEscape(hydrated.ID))
+			for _, ref := range hydrated.References {
+				if (ref.Type == "ADVISORY" || ref.Type == "WEB") && strings.HasPrefix(ref.URL, "http") {
+					vulnURL = ref.URL
+					break
+				}
+			}
+			entry.Vulnerabilities[idx].Details = hydrated.Details
+			entry.Vulnerabilities[idx].URL = vulnURL
+			entry.Vulnerabilities[idx].Severity = extractHighestCVSSScore(hydrated)
+			updated = true
 		}
 		if updated {
 			osvCache[key] = entry
@@ -951,10 +1092,10 @@ func fetchOSVBatch(pkgs []pkgKey, hosts []HostPayload, newestTime time.Time) {
 	}
 	osvCacheMu.Unlock()
 
-	// STEP 4: Overwrite payload cache and disk file with full severity ratings
+	// STEP 4: Republish the fully enriched payload if no newer scan/files won.
 	attachCachedOSV(hosts)
 	saveOSVCacheToDisk()
-	updatePayloadCache(hosts, newestTime)
+	publishOSVPayload(hosts, newestTime, scanSeq, payloadSeq)
 	log.Printf("OSV severity enrichment complete: payload and cache updated with CVSS scores.")
 }
 
@@ -980,18 +1121,44 @@ func handlePackages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-OSV-Enabled", fmt.Sprintf("%t", activeOSVEnabled))
+	w.Header().Set("Vary", "Accept-Encoding")
+	w.Header().Set("X-OSV-Enabled", strconv.FormatBool(activeOSVEnabled))
 	if !modTime.IsZero() {
 		w.Header().Set("Last-Modified", modTime.UTC().Format(http.TimeFormat))
 	}
 
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+	if !modTime.IsZero() {
+		if since, err := http.ParseTime(r.Header.Get("If-Modified-Since")); err == nil && !modTime.After(since) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
+	if acceptsGzip(r.Header.Get("Accept-Encoding")) {
 		w.Header().Set("Content-Encoding", "gzip")
 		_, _ = w.Write(gzData)
 		return
 	}
 
 	_, _ = w.Write(rawJSON)
+}
+
+// acceptsGzip honors quality values, so "gzip;q=0" does not enable gzip.
+func acceptsGzip(header string) bool {
+	for _, part := range strings.Split(header, ",") {
+		name, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil || !strings.EqualFold(name, "gzip") {
+			continue
+		}
+		if q, ok := params["q"]; ok {
+			value, err := strconv.ParseFloat(q, 64)
+			if err == nil && value <= 0 {
+				continue
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func handleHistory(w http.ResponseWriter, r *http.Request) {
@@ -1105,7 +1272,18 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func installSystemdService(port, dataPath, psk string, tlsEnabled, osvEnabled bool, osvURL, osvProxy string, osvCacheTTL time.Duration) error {
+// systemdEnvValue quotes a value according to systemd EnvironmentFile rules:
+// backslashes, quotes, dollar signs and backticks must be escaped because
+// double-quoted values are subject to variable expansion.
+func systemdEnvValue(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	value = strings.ReplaceAll(value, `$`, `\$`)
+	value = strings.ReplaceAll(value, "`", "\\`")
+	return `"` + value + `"`
+}
+
+func installSystemdService(port, dataPath, psk string, tlsEnabled bool, tlsHosts, serviceUser string, osvEnabled bool, osvURL, osvProxy string, osvCacheTTL time.Duration) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
@@ -1125,20 +1303,27 @@ func installSystemdService(port, dataPath, psk string, tlsEnabled, osvEnabled bo
 		}
 	}
 
-	envContent := fmt.Sprintf(`PKGDASH_PORT=%q
-PKGDASH_DATA_PATH=%q
-PKGDASH_PSK=%q
+	envContent := fmt.Sprintf(`PKGDASH_PORT=%s
+PKGDASH_DATA_PATH=%s
+PKGDASH_PSK=%s
 PKGDASH_TLS="%t"
+PKGDASH_TLS_HOSTS=%s
 PKGDASH_ENABLE_OSV="%t"
-PKGDASH_OSV_URL=%q
-PKGDASH_OSV_PROXY=%q
-PKGDASH_OSV_CACHE_TTL=%q
-`, port, dataPath, psk, tlsEnabled, osvEnabled, osvURL, osvProxy, osvCacheTTL.String())
+PKGDASH_OSV_URL=%s
+PKGDASH_OSV_PROXY=%s
+PKGDASH_OSV_CACHE_TTL=%s
+`, systemdEnvValue(port), systemdEnvValue(dataPath), systemdEnvValue(psk), tlsEnabled,
+		systemdEnvValue(tlsHosts), osvEnabled, systemdEnvValue(osvURL), systemdEnvValue(osvProxy),
+		systemdEnvValue(osvCacheTTL.String()))
 
 	if err := os.WriteFile(envFilePath, []byte(envContent), 0600); err != nil {
 		return fmt.Errorf("failed to write environment file %s: %w", envFilePath, err)
 	}
 
+	userDirective := ""
+	if strings.TrimSpace(serviceUser) != "" {
+		userDirective = "User=" + strings.TrimSpace(serviceUser) + "\n"
+	}
 	unitContent := fmt.Sprintf(`[Unit]
 Description=pkgdash package listener daemon
 After=network.target
@@ -1148,11 +1333,9 @@ Type=simple
 EnvironmentFile=-%s
 ExecStart=%s
 Restart=always
-User=root
-
-[Install]
+%s[Install]
 WantedBy=multi-user.target
-`, envFilePath, targetPath)
+`, envFilePath, targetPath, userDirective)
 
 	unitPath := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
 	if err := os.WriteFile(unitPath, []byte(unitContent), 0644); err != nil {
@@ -1173,11 +1356,24 @@ WantedBy=multi-user.target
 }
 
 func uninstallSystemdService() error {
-	_ = exec.Command("systemctl", "stop", serviceName).Run()
-	_ = exec.Command("systemctl", "disable", serviceName).Run()
-	_ = os.Remove(fmt.Sprintf("/etc/systemd/system/%s.service", serviceName))
-	_ = os.Remove(envFilePath)
-	_ = exec.Command("systemctl", "daemon-reload").Run()
-	_ = os.Remove(filepath.Join(installDir, serviceName))
-	return nil
+	var errs []error
+	unitPath := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
+	_, unitExists := os.Stat(unitPath)
+	if unitExists == nil {
+		if err := exec.Command("systemctl", "stop", serviceName).Run(); err != nil {
+			errs = append(errs, fmt.Errorf("stop service: %w", err))
+		}
+		if err := exec.Command("systemctl", "disable", serviceName).Run(); err != nil {
+			errs = append(errs, fmt.Errorf("disable service: %w", err))
+		}
+	}
+	for _, path := range []string{unitPath, envFilePath, filepath.Join(installDir, serviceName)} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove %s: %w", path, err))
+		}
+	}
+	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		errs = append(errs, fmt.Errorf("daemon-reload: %w", err))
+	}
+	return errors.Join(errs...)
 }

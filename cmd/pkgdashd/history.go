@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"container/heap"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,20 +24,35 @@ type ChangeEvent struct {
 	Action     string    `json:"action"` // "ADDED", "REMOVED", "MODIFIED"
 }
 
+const (
+	maxHistoryBytes   = 16 << 20
+	maxHistoryBackups = 3
+)
+
 type HistoryManager struct {
 	mu       sync.RWMutex
 	filePath string
 }
 
 func NewHistoryManager(dataPath string) *HistoryManager {
-	return &HistoryManager{
-		filePath: filepath.Join(dataPath, "history.jsonl"),
+	if err := os.MkdirAll(dataPath, 0750); err != nil {
+		log.Printf("Failed to create data directory %s: %v", dataPath, err)
 	}
+	return &HistoryManager{filePath: filepath.Join(dataPath, "history.jsonl")}
 }
 
 func (hm *HistoryManager) RecordChanges(events []ChangeEvent) {
+	if len(events) == 0 {
+		return
+	}
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
+
+	if info, err := os.Stat(hm.filePath); err == nil && info.Size() > maxHistoryBytes {
+		if err := hm.rotate(); err != nil {
+			log.Printf("Failed to rotate history file: %v", err)
+		}
+	}
 
 	f, err := os.OpenFile(hm.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 	if err != nil {
@@ -48,8 +66,41 @@ func (hm *HistoryManager) RecordChanges(events []ChangeEvent) {
 		if err != nil {
 			continue
 		}
-		_, _ = f.Write(append(data, '\n'))
+		if _, err := f.Write(append(data, '\n')); err != nil {
+			log.Printf("Failed to write history event: %v", err)
+			return
+		}
 	}
+}
+
+// rotate keeps a bounded number of old history files. Caller holds the lock.
+func (hm *HistoryManager) rotate() error {
+	for i := maxHistoryBackups; i >= 1; i-- {
+		src := fmt.Sprintf("%s.%d", hm.filePath, i)
+		dst := fmt.Sprintf("%s.%d", hm.filePath, i+1)
+		if _, err := os.Stat(src); err == nil {
+			if err := os.Rename(src, dst); err != nil {
+				return err
+			}
+		}
+	}
+	return os.Rename(hm.filePath, hm.filePath+".1")
+}
+
+// eventHeap is a min-heap by timestamp. It lets GetHistory keep only the newest
+// N events without loading an unbounded file into memory.
+type eventHeap []ChangeEvent
+
+func (h eventHeap) Len() int           { return len(h) }
+func (h eventHeap) Less(i, j int) bool { return h[i].Timestamp.Before(h[j].Timestamp) }
+func (h eventHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *eventHeap) Push(x any)        { *h = append(*h, x.(ChangeEvent)) }
+func (h *eventHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
 }
 
 func (hm *HistoryManager) GetHistory(hostname, pkgName string, limit int) []ChangeEvent {
@@ -57,46 +108,66 @@ func (hm *HistoryManager) GetHistory(hostname, pkgName string, limit int) []Chan
 	defer hm.mu.RUnlock()
 
 	f, err := os.Open(hm.filePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
+		log.Printf("Failed to read history file: %v", err)
 		return nil
 	}
 	defer func() { _ = f.Close() }()
 
-	var events []ChangeEvent
+	keep := eventHeap{}
+	heap.Init(&keep)
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 		var evt ChangeEvent
-		if err := json.Unmarshal([]byte(line), &evt); err == nil {
-			if hostname != "" && !strings.EqualFold(evt.Hostname, hostname) {
-				continue
-			}
-			if pkgName != "" && !strings.EqualFold(evt.Package, pkgName) {
-				continue
-			}
-			events = append(events, evt)
+		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+			continue
 		}
+		if hostname != "" && !strings.EqualFold(evt.Hostname, hostname) {
+			continue
+		}
+		if pkgName != "" && !strings.EqualFold(evt.Package, pkgName) {
+			continue
+		}
+		if limit > 0 && keep.Len() >= limit {
+			if !evt.Timestamp.After(keep[0].Timestamp) {
+				continue
+			}
+			heap.Pop(&keep)
+		}
+		heap.Push(&keep, evt)
 	}
-	_ = scanner.Err()
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error scanning history file: %v", err)
+	}
 
+	events := []ChangeEvent(keep)
 	sort.Slice(events, func(i, j int) bool {
 		return events[i].Timestamp.After(events[j].Timestamp)
 	})
-
-	if limit > 0 && len(events) > limit {
-		return events[:limit]
-	}
 	return events
+}
+
+// packageStateKey includes the architecture so multi-arch packages do not
+// overwrite each other in the change history.
+func packageStateKey(name, arch string) string {
+	if arch == "" {
+		return name
+	}
+	return name + " (" + arch + ")"
 }
 
 func ComputeDiffs(prev, curr map[string]map[string]string) []ChangeEvent {
 	var diffs []ChangeEvent
 	now := time.Now().UTC()
 
-	// Check for added or modified
 	for host, currPkgs := range curr {
 		prevPkgs, hostExisted := prev[host]
 		if !hostExisted {
@@ -114,7 +185,8 @@ func ComputeDiffs(prev, curr map[string]map[string]string) []ChangeEvent {
 
 		for pkg, currVer := range currPkgs {
 			prevVer, pkgExisted := prevPkgs[pkg]
-			if !pkgExisted {
+			switch {
+			case !pkgExisted:
 				diffs = append(diffs, ChangeEvent{
 					Timestamp:  now,
 					Hostname:   host,
@@ -122,7 +194,7 @@ func ComputeDiffs(prev, curr map[string]map[string]string) []ChangeEvent {
 					NewVersion: currVer,
 					Action:     "ADDED",
 				})
-			} else if prevVer != currVer {
+			case prevVer != currVer:
 				diffs = append(diffs, ChangeEvent{
 					Timestamp:  now,
 					Hostname:   host,
@@ -135,13 +207,20 @@ func ComputeDiffs(prev, curr map[string]map[string]string) []ChangeEvent {
 		}
 	}
 
-	// Check for removed
 	for host, prevPkgs := range prev {
 		currPkgs, hostStillExists := curr[host]
-		if !hostStillExists {
-			continue
-		}
 		for pkg, prevVer := range prevPkgs {
+			if !hostStillExists {
+				// A host that stopped reporting no longer has any packages.
+				diffs = append(diffs, ChangeEvent{
+					Timestamp:  now,
+					Hostname:   host,
+					Package:    pkg,
+					OldVersion: prevVer,
+					Action:     "REMOVED",
+				})
+				continue
+			}
 			if _, pkgStillExists := currPkgs[pkg]; !pkgStillExists {
 				diffs = append(diffs, ChangeEvent{
 					Timestamp:  now,

@@ -95,6 +95,7 @@ sudo ./pkgdashd --uninstall
 * `--osv-proxy`: Optional HTTP/HTTPS proxy URL for OSV requests.
 * `--osv-cache-ttl`: OSV cache TTL duration (e.g., `6h`, `12h`, `24h`, default `12h`).
 * `--tls-hosts`: Extra DNS names/IP addresses to include as SANs in the auto-generated certificate (comma-separated). `localhost`, `127.0.0.1`, `::1` and the machine hostname are always included.
+* `--service-user`: Optional user account for the installed systemd service (default: root). Provide a user with read access to the data directory to avoid running the listener as root.
 
 A PSK is only accepted when TLS is enabled: the daemon refuses to start with `--psk` over plain HTTP. The generated self-signed certificate (`<data-path>/cert.pem`) can be used as the CA file by clients:
 
@@ -117,6 +118,7 @@ When installing as a systemd service (`--install`), options (including sensitive
 | `PKGDASH_PSK`           | `--psk`           | `""`                  |
 | `PKGDASH_TLS`           | `--tls`           | `false`               |
 | `PKGDASH_TLS_HOSTS`     | `--tls-hosts`     | `""`                  |
+| `PKGDASH_SERVICE_USER`  | `--service-user`  | `""`                  |
 | `PKGDASH_ENABLE_OSV`    | `--enable-osv`    | `false`               |
 | `PKGDASH_OSV_URL`       | `--osv-url`       | `https://api.osv.dev` |
 | `PKGDASH_OSV_PROXY`     | `--osv-proxy`     | `""`                  |
