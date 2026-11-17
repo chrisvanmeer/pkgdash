@@ -15,35 +15,59 @@ const (
 	SortVer  SortField = "ver"
 )
 
+type sortKey struct {
+	host    string
+	os      string
+	pkg     string
+	version versionTokenList
+}
+
 // SortItems sorts rows by the requested field. Ties are broken consistently by
 // hostname, package and version so both clients show the same order.
 func SortItems(items []FlatItem, field SortField, descending bool) {
-	sort.SliceStable(items, func(i, j int) bool {
-		a, b := items[i], items[j]
-		ah, bh := strings.ToLower(a.Hostname), strings.ToLower(b.Hostname)
-		ao, bo := strings.ToLower(OSLabel(a.OSName, a.OSVersion)), strings.ToLower(OSLabel(b.OSName, b.OSVersion))
-		ap, bp := strings.ToLower(a.PkgName), strings.ToLower(b.PkgName)
+	// Compute the comparison keys once per row. The previous implementation
+	// lowercased strings and tokenized versions inside every comparison,
+	// which grew to millions of allocations for large inventories.
+	type row struct {
+		item FlatItem
+		key  sortKey
+	}
+	rows := make([]row, len(items))
+	for i, item := range items {
+		rows[i] = row{
+			item: item,
+			key: sortKey{
+				host:    strings.ToLower(item.Hostname),
+				os:      strings.ToLower(OSLabel(item.OSName, item.OSVersion)),
+				pkg:     strings.ToLower(item.PkgName),
+				version: versionTokens(item.Version),
+			},
+		}
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i].key, rows[j].key
 
 		var primaryLess, primaryEqual bool
 		switch field {
 		case SortOS:
-			primaryLess, primaryEqual = ao < bo, ao == bo
+			primaryLess, primaryEqual = a.os < b.os, a.os == b.os
 		case SortPkg:
-			primaryLess, primaryEqual = ap < bp, ap == bp
+			primaryLess, primaryEqual = a.pkg < b.pkg, a.pkg == b.pkg
 		case SortVer:
-			primaryLess, primaryEqual = compareVersions(a.Version, b.Version), a.Version == b.Version
+			primaryLess, primaryEqual = a.version.less(b.version), versionTokensEqual(a.version, b.version)
 		default:
-			primaryLess, primaryEqual = ah < bh, ah == bh
+			primaryLess, primaryEqual = a.host < b.host, a.host == b.host
 		}
 
 		if primaryEqual {
 			switch {
-			case ah != bh:
-				return ah < bh
-			case ap != bp:
-				return ap < bp
+			case a.host != b.host:
+				return a.host < b.host
+			case a.pkg != b.pkg:
+				return a.pkg < b.pkg
 			default:
-				return compareVersions(a.Version, b.Version)
+				return a.version.less(b.version)
 			}
 		}
 		if descending {
@@ -51,6 +75,9 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 		}
 		return primaryLess
 	})
+	for i, r := range rows {
+		items[i] = r.item
+	}
 }
 
 type versionToken struct {
@@ -59,11 +86,24 @@ type versionToken struct {
 	text   string
 }
 
-// compareVersions compares version strings naturally, so 1.10 sorts after 1.9.
-func compareVersions(a, b string) bool {
-	ta, tb := versionTokens(a), versionTokens(b)
-	for i := 0; i < len(ta) && i < len(tb); i++ {
-		x, y := ta[i], tb[i]
+type versionTokenList []versionToken
+
+func versionTokensEqual(a, b []versionToken) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (tokens versionTokenList) less(other versionTokenList) bool {
+	a, b := tokens, other
+	for i := 0; i < len(a) && i < len(b); i++ {
+		x, y := a[i], b[i]
 		switch {
 		case x.number && y.number:
 			if x.value != y.value {
@@ -75,10 +115,10 @@ func compareVersions(a, b string) bool {
 			return x.text < y.text
 		}
 	}
-	return len(ta) < len(tb)
+	return len(a) < len(b)
 }
 
-func versionTokens(s string) []versionToken {
+func versionTokens(s string) versionTokenList {
 	s = strings.ToLower(strings.TrimSpace(s))
 	var tokens []versionToken
 	for i := 0; i < len(s); {

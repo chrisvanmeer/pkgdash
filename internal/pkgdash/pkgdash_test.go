@@ -60,6 +60,55 @@ func TestOSLabelAndFilter(t *testing.T) {
 	check("", "", "", "", true, "host03")
 }
 
+func TestFilterNoQueryReturnsOriginal(t *testing.T) {
+	items := []FlatItem{
+		{Hostname: "h1", PkgName: "a", Version: "1"},
+		{Hostname: "h2", PkgName: "b", Version: "2"},
+	}
+	got := Filter(items, "", "", "", "", false)
+	if len(got) != len(items) || got[0].Hostname != "h1" || got[1].Hostname != "h2" {
+		t.Fatalf("Filter no-query = %+v, want original items", got)
+	}
+	// The fast path must not copy: callers rely on this to avoid O(N) work per
+	// streaming chunk. Verify by checking the backing array is shared.
+	if len(got) > 0 && &got[0] != &items[0] {
+		t.Fatal("Filter no-query copied the slice; fast path was lost")
+	}
+}
+
+func TestSortItemsFieldsAndDescending(t *testing.T) {
+	items := []FlatItem{
+		{Hostname: "b", OSName: "Zorin", OSVersion: "17", PkgName: "zeta", Version: "1.9"},
+		{Hostname: "a", OSName: "Alpine", OSVersion: "3.19", PkgName: "alpha", Version: "1.10"},
+		{Hostname: "c", OSName: "Debian", OSVersion: "12", PkgName: "beta", Version: "1.2"},
+	}
+
+	tests := []struct {
+		name       string
+		field      SortField
+		descending bool
+		want       []string
+	}{
+		{"host asc", SortHost, false, []string{"a", "b", "c"}},
+		{"host desc", SortHost, true, []string{"c", "b", "a"}},
+		{"os asc", SortOS, false, []string{"a", "c", "b"}},
+		{"pkg asc", SortPkg, false, []string{"a", "c", "b"}},
+		{"ver asc", SortVer, false, []string{"c", "b", "a"}},
+		{"ver desc", SortVer, true, []string{"a", "b", "c"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows := append([]FlatItem(nil), items...)
+			SortItems(rows, tt.field, tt.descending)
+			for i, want := range tt.want {
+				if rows[i].Hostname != want {
+					t.Fatalf("row %d = %s, want %s", i, rows[i].Hostname, want)
+				}
+			}
+		})
+	}
+}
+
 func TestSortItemsNaturalVersions(t *testing.T) {
 	items := []FlatItem{
 		{Hostname: "h", PkgName: "p", Version: "1.9"},

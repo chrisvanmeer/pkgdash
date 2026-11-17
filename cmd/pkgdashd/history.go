@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"container/heap"
 	"encoding/json"
 	"errors"
@@ -119,15 +120,30 @@ func (hm *HistoryManager) GetHistory(hostname, pkgName string, limit int) []Chan
 
 	keep := eventHeap{}
 	heap.Init(&keep)
+
+	// Pre-filter on the raw JSON line so irrelevant events are never unmarshalled.
+	// The exact EqualFold checks below still run after unmarshalling, so this can
+	// only skip lines that could never match (no false negatives).
+	hostFilter := []byte(strings.ToLower(hostname))
+	pkgFilter := []byte(strings.ToLower(pkgName))
+	hostASCII := isASCII(hostname)
+	pkgASCII := isASCII(pkgName)
+
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if hostname != "" && hostASCII && !containsFoldASCII(line, hostFilter) {
+			continue
+		}
+		if pkgName != "" && pkgASCII && !containsFoldASCII(line, pkgFilter) {
 			continue
 		}
 		var evt ChangeEvent
-		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+		if err := json.Unmarshal(line, &evt); err != nil {
 			continue
 		}
 		if hostname != "" && !strings.EqualFold(evt.Hostname, hostname) {
@@ -153,6 +169,46 @@ func (hm *HistoryManager) GetHistory(hostname, pkgName string, limit int) []Chan
 		return events[i].Timestamp.After(events[j].Timestamp)
 	})
 	return events
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLower(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+// containsFoldASCII reports whether haystack contains needle, ignoring ASCII
+// case. It allocates nothing, which matters when scanning millions of lines.
+func containsFoldASCII(haystack, needle []byte) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	if len(needle) > len(haystack) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		matched := true
+		for j := 0; j < len(needle); j++ {
+			if asciiLower(haystack[i+j]) != asciiLower(needle[j]) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 // packageStateKey includes the architecture so multi-arch packages do not

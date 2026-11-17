@@ -46,6 +46,36 @@ func TestHistoryManagerReturnsNewestEventsOnly(t *testing.T) {
 	}
 }
 
+func TestHistoryManagerPreFilterCaseInsensitive(t *testing.T) {
+	hm := NewHistoryManager(t.TempDir())
+	now := time.Now()
+	events := []ChangeEvent{
+		{Timestamp: now.Add(1 * time.Minute), Hostname: "Web-01", Package: "Nginx", Action: "ADDED"},
+		{Timestamp: now.Add(2 * time.Minute), Hostname: "db-02", Package: "Postgres", Action: "ADDED"},
+		{Timestamp: now.Add(3 * time.Minute), Hostname: "WEB-01", Package: "Curl", Action: "MODIFIED"},
+	}
+	hm.RecordChanges(events)
+
+	// The raw-line pre-filter uses ASCII case folding; the final EqualFold
+	// check must still produce the same result as an unfiltered scan.
+	got := hm.GetHistory("web-01", "", 10)
+	if len(got) != 2 {
+		t.Fatalf("got %d events for host filter, want 2: %+v", len(got), got)
+	}
+
+	got = hm.GetHistory("", "nginx", 10)
+	if len(got) != 1 || got[0].Hostname != "Web-01" {
+		t.Fatalf("got %+v for package filter, want the Nginx event", got)
+	}
+
+	// Non-ASCII queries bypass the pre-filter and must still work.
+	hm.RecordChanges([]ChangeEvent{{Timestamp: now.Add(4 * time.Minute), Hostname: "héllo", Package: "pkg", Action: "ADDED"}})
+	got = hm.GetHistory("HÉLLO", "", 10)
+	if len(got) != 1 || got[0].Hostname != "héllo" {
+		t.Fatalf("got %+v for non-ASCII filter, want the héllo event", got)
+	}
+}
+
 func TestSystemdEnvValueEscaping(t *testing.T) {
 	value := `pa$ss"word\with` + "`tick`"
 	got := systemdEnvValue(value)

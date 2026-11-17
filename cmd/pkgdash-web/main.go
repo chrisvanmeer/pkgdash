@@ -405,14 +405,18 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 	dataMutex.RLock()
 	defer dataMutex.RUnlock()
 
-	filtered := pkgdash.Filter(
-		globalItems,
-		r.URL.Query().Get("host"),
-		r.URL.Query().Get("os"),
-		r.URL.Query().Get("pkg"),
-		r.URL.Query().Get("ver"),
-		r.URL.Query().Get("vulnOnly") == "true",
-	)
+	hostQuery := r.URL.Query().Get("host")
+	osQuery := r.URL.Query().Get("os")
+	pkgQuery := r.URL.Query().Get("pkg")
+	verQuery := r.URL.Query().Get("ver")
+	vulnOnly := r.URL.Query().Get("vulnOnly") == "true"
+
+	filtered := pkgdash.Filter(globalItems, hostQuery, osQuery, pkgQuery, verQuery, vulnOnly)
+	if hostQuery == "" && osQuery == "" && pkgQuery == "" && verQuery == "" && !vulnOnly {
+		// Filter returns the original slice for the no-query fast path. Copy it
+		// here because SortItems mutates its argument and globalItems is shared.
+		filtered = append([]FlatItem(nil), filtered...)
+	}
 
 	fields := map[string]pkgdash.SortField{
 		"os":  pkgdash.SortOS,

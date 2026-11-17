@@ -63,12 +63,29 @@ func IsLikelyRegex(query string) bool {
 	return strings.Contains(query, "+")
 }
 
+var matchAll = func(string) bool { return true }
+
 // Filter applies all four client filters plus the optional vuln-only mode.
-func Filter(items []FlatItem, host, os, pkg, ver string, vulnOnly bool) []FlatItem {
-	hMatch := NewMatcher(host)
-	oMatch := NewMatcher(os)
-	pMatch := NewMatcher(pkg)
-	vMatch := NewMatcher(ver)
+func Filter(items []FlatItem, host, osName, pkg, ver string, vulnOnly bool) []FlatItem {
+	if host == "" && osName == "" && pkg == "" && ver == "" && !vulnOnly {
+		return items
+	}
+
+	// Only allocate a matcher for fields that actually have a query. For empty
+	// fields this avoids building a closure and lowercasing every row value.
+	hMatch, oMatch, pMatch, vMatch := matchAll, matchAll, matchAll, matchAll
+	if host != "" {
+		hMatch = NewMatcher(host)
+	}
+	if osName != "" {
+		oMatch = NewMatcher(osName)
+	}
+	if pkg != "" {
+		pMatch = NewMatcher(pkg)
+	}
+	if ver != "" {
+		vMatch = NewMatcher(ver)
+	}
 
 	filtered := make([]FlatItem, 0, len(items))
 	for _, item := range items {
