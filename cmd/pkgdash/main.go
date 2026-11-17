@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -340,9 +341,16 @@ var (
 	historyHTTPClient *http.Client
 )
 
+// Loading a large inventory allocates hundreds of MB in a short burst. With
+// the default GOGC=100 that triggers repeated stop-the-world collections (the
+// 20-55 ms stalls in decode and Update). Raise the threshold for the load and
+// restore it once the data is sorted and visible.
+var originalGCPercent int
+
 func main() {
 	initTiming()
 	defer flushTiming()
+	originalGCPercent = debug.SetGCPercent(400)
 
 	flagMinSev := flag.Float64("min-severity", -1, "Minimum CVSS severity threshold to display vulnerabilities")
 	flagCAFile := flag.String("ca-file", "", "PEM file containing the CA that signed the daemon certificate")
@@ -1067,6 +1075,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateSyncError()
 			m.sortData()
 			m.updateViewport()
+			var gcStats debug.GCStats
+			debug.ReadGCStats(&gcStats)
+			timingLog("after load: %d GCs, total GC pause %s",
+				gcStats.NumGC, gcStats.PauseTotal.Truncate(time.Millisecond))
+			debug.SetGCPercent(originalGCPercent)
 			return m, nil
 		}
 
