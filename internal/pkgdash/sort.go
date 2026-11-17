@@ -32,6 +32,14 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 		return
 	}
 
+	// The daemon delivers hosts and their packages in a stable order, so the
+	// inventory is often already sorted by the default (host) field. Check
+	// before building any keys: this makes the common initial-load case O(n)
+	// with no allocations instead of an O(n log n) sort with ~86 MB of keys.
+	if field == SortHost && !descending && sortedByHostPkg(items) {
+		return
+	}
+
 	// Sort a compact key array plus a permutation instead of copying whole
 	// FlatItem structs (with their vulnerability slices) into an intermediate
 	// array. That intermediate was ~125 MB of allocations for 185k rows right
@@ -98,6 +106,21 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 		return primaryLess
 	}
 
+	// The daemon returns hosts and their packages in a stable order, so the
+	// inventory is often already sorted by the default (host) field. Checking
+	// adjacent keys is O(n) and lets us skip the O(n log n) sort entirely in
+	// that common case -- a large win for the TUI's initial load.
+	alreadySorted := true
+	for i := 1; i < n; i++ {
+		if !less(keys[perm[i-1]], keys[perm[i]]) {
+			alreadySorted = false
+			break
+		}
+	}
+	if alreadySorted {
+		return
+	}
+
 	sort.Slice(perm, func(i, j int) bool {
 		return less(keys[perm[i]], keys[perm[j]])
 	})
@@ -126,6 +149,31 @@ func SortItems(items []FlatItem, field SortField, descending bool) {
 // versionToken packs a version component into 8 bytes. Numeric components
 // store their value in the low 32 bits with the top bit set; text components
 // store an offset (high 32 bits) and length (low 32 bits) into a shared buffer.
+// sortedByHostPkg reports whether items are in ascending (host, package)
+// order, matching the tie-break order used by SortItems. It is a cheap pre-check
+// for the common case where the daemon already returns sorted data.
+func sortedByHostPkg(items []FlatItem) bool {
+	prevHost := strings.ToLower(items[0].Hostname)
+	prevPkg := ""
+	for _, item := range items {
+		host := strings.ToLower(item.Hostname)
+		if host < prevHost {
+			return false
+		}
+		if host == prevHost {
+			pkg := strings.ToLower(item.PkgName)
+			if pkg < prevPkg {
+				return false
+			}
+			prevPkg = pkg
+		} else {
+			prevPkg = ""
+		}
+		prevHost = host
+	}
+	return true
+}
+
 type versionToken uint64
 
 const (

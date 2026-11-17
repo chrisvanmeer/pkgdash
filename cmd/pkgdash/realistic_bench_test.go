@@ -67,4 +67,14 @@ func BenchmarkSortRealistic(b *testing.B) {
 			benchSink = rows
 		}
 	})
+	b.Run("HostAlreadySorted", func(b *testing.B) {
+		sorted := append([]pkgdash.FlatItem(nil), items...)
+		pkgdash.SortItems(sorted, pkgdash.SortHost, false)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			rows := append([]pkgdash.FlatItem(nil), sorted...)
+			pkgdash.SortItems(rows, pkgdash.SortHost, false)
+			benchSink = rows
+		}
+	})
 }
