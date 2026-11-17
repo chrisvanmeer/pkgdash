@@ -247,7 +247,13 @@ The specification features:
 | `Ctrl+A`                | Open OSV Advisory modal for the selected package                    |
 | `Ctrl+U`                | Toggle "Vulns Only" filter mode (show vulnerable packages only)     |
 | `Ctrl+C`                | Open About / Control Center modal                                   |
+| `F1`                    | Show the keyboard shortcuts modal                                   |
 | `Esc`                   | Close modal / Exit dashboard                                        |
+
+If one or more daemons are unreachable, the header shows `⚠ PARTIAL SYNC` and
+the affected server(s) with their error in the status line. The fleet audit log
+shows a loading indicator until all daemon histories have been fetched, and
+late responses from an earlier request are ignored.
 
 ---
 

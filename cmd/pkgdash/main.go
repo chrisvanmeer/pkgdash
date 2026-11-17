@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -103,6 +104,12 @@ var (
 	readyBadge = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#11111B")).
 			Background(cGreen).
+			Padding(0, 1).
+			Bold(true)
+
+	syncErrBadge = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#11111B")).
+			Background(cPink).
 			Padding(0, 1).
 			Bold(true)
 
@@ -221,13 +228,16 @@ func renderSevBadge(sev float64) string {
 }
 
 type dataMsg struct {
+	server    string
 	items     []FlatItem
 	timestamp time.Time
 	isDone    bool
 	hasOSV    bool
+	err       string
 }
 
 type historyDataMsg struct {
+	requestID uint64
 	events    []ChangeEvent
 	queryHost string
 	queryPkg  string
@@ -281,10 +291,12 @@ type model struct {
 	selectedPkgName         string
 
 	// Fleet History (Time Travel)
-	showHistoryView bool
-	historyEvents   []ChangeEvent
-	historyCursor   int
-	historyOffset   int
+	showHistoryView  bool
+	historyLoading   bool
+	historyRequestID uint64
+	historyEvents    []ChangeEvent
+	historyCursor    int
+	historyOffset    int
 
 	// Host History Events
 	hostHistoryEvents []ChangeEvent
@@ -311,6 +323,8 @@ type model struct {
 	diffOnlyDiffs     bool
 
 	flashMsg   string
+	syncIssues map[string]string
+	syncError  string
 	updateChan chan dataMsg
 	hasTLS     bool
 	hasPSK     bool
@@ -392,7 +406,11 @@ func main() {
 	diffF.Placeholder = "Filter compared packages..."
 	diffF.Prompt = ""
 
-	updateChan := make(chan dataMsg)
+	// One message per daemon plus the final "done" marker. Buffering avoids
+	// blocking producers if the user quits before all servers responded.
+	updateChan := make(chan dataMsg, len(servers)+1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	hasTLS := !tlsOpts.Insecure
 	for _, s := range servers {
@@ -421,6 +439,7 @@ func main() {
 		showAboutModal:  false,
 		showHostModal:   false,
 		loaded:          false,
+		syncIssues:      make(map[string]string),
 		updateChan:      updateChan,
 		hasTLS:          hasTLS,
 		hasPSK:          psk != "",
@@ -428,12 +447,13 @@ func main() {
 		showOnlyVulns:   false,
 	}
 
-	go fetchAllDataAsync(servers, psk, minSev, updateChan)
+	go fetchAllDataAsync(ctx, servers, psk, minSev, updateChan)
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running TUI: %v\n", err)
 	}
+	cancel()
 }
 
 func getConfig() ([]string, string, float64) {
@@ -441,21 +461,36 @@ func getConfig() ([]string, string, float64) {
 	return cfg.Servers, cfg.PSK, cfg.MinSeverity
 }
 
-func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan chan dataMsg) {
+func fetchAllDataAsync(ctx context.Context, servers []string, psk string, minSev float64, updateChan chan dataMsg) {
 	var wg sync.WaitGroup
+	send := func(msg dataMsg) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case updateChan <- msg:
+			return true
+		}
+	}
 
 	for _, s := range servers {
 		wg.Add(1)
 		go func(server string) {
 			defer wg.Done()
+			// Report failures through the UI instead of logging to stderr,
+			// which would corrupt Bubble Tea's alternate screen.
+			fail := func(format string, args ...any) {
+				send(dataMsg{server: server, err: fmt.Sprintf(format, args...)})
+			}
+
 			url, err := pkgdash.Endpoint(server, psk, "/packages")
 			if err != nil {
-				log.Printf("Cannot query %s: %v", server, err)
+				fail("%v", err)
 				return
 			}
 
-			req, err := http.NewRequest(http.MethodGet, url, nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
+				fail("%v", err)
 				return
 			}
 			req.Header.Set("Accept-Encoding", "gzip")
@@ -465,10 +500,14 @@ func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan 
 
 			resp, err := apiClient.Do(req)
 			if err != nil {
+				if ctx.Err() == nil {
+					fail("%v", err)
+				}
 				return
 			}
 			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != http.StatusOK {
+				fail("HTTP %s", resp.Status)
 				return
 			}
 
@@ -493,20 +532,22 @@ func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan 
 			decoder := json.NewDecoder(reader)
 			token, err := decoder.Token()
 			if err != nil {
+				fail("invalid response: %v", err)
 				return
 			}
 			if delim, ok := token.(json.Delim); !ok || delim != '[' {
+				fail("unexpected response payload")
 				return
 			}
 
 			for decoder.More() {
 				var host HostPayload
 				if err := decoder.Decode(&host); err != nil {
-					break
+					fail("invalid host record: %v", err)
+					return
 				}
 
 				isOSV := osvHeaderActive || host.OSVEnabled
-
 				var localItems []FlatItem
 				for _, pkg := range host.Packages {
 					var filteredVulns []Vulnerability
@@ -515,7 +556,6 @@ func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan 
 							filteredVulns = append(filteredVulns, v)
 						}
 					}
-
 					localItems = append(localItems, FlatItem{
 						Hostname:        host.Hostname,
 						IPAddress:       host.IPAddress,
@@ -530,30 +570,33 @@ func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan 
 					})
 				}
 
-				updateChan <- dataMsg{
+				if !send(dataMsg{
+					server:    server,
 					items:     localItems,
 					timestamp: serverMaxTime,
-					isDone:    false,
 					hasOSV:    isOSV,
+				}) {
+					return
 				}
 			}
+			// An empty but successful response clears any previous issue.
+			send(dataMsg{server: server})
 		}(s)
 	}
 
 	go func() {
 		wg.Wait()
-		updateChan <- dataMsg{isDone: true}
+		send(dataMsg{isDone: true})
 	}()
 }
 
-func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string) tea.Cmd {
+func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string, requestID uint64) tea.Cmd {
 	return func() tea.Msg {
 		var allEvents []ChangeEvent
 
 		for _, s := range servers {
 			url, err := pkgdash.HistoryURL(s, psk, hostname, pkgName)
 			if err != nil {
-				log.Printf("Cannot query history on %s: %v", s, err)
 				continue
 			}
 
@@ -586,6 +629,7 @@ func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string) tea
 			return allEvents[i].Timestamp.Before(allEvents[j].Timestamp)
 		})
 		return historyDataMsg{
+			requestID: requestID,
 			events:    allEvents,
 			queryHost: hostname,
 			queryPkg:  pkgName,
@@ -595,6 +639,82 @@ func fetchHistoryCmd(servers []string, psk string, hostname, pkgName string) tea
 
 func waitForUpdate(sub chan dataMsg) tea.Cmd {
 	return func() tea.Msg { return <-sub }
+}
+
+// requestHistory starts a new history lookup and tags it so late responses
+// from a previous request cannot overwrite the visible panel.
+func (m *model) requestHistory(hostname, pkgName string) tea.Cmd {
+	m.historyRequestID++
+	m.historyLoading = true
+	if m.syncIssues == nil {
+		m.syncIssues = make(map[string]string)
+	}
+	return fetchHistoryCmd(m.servers, m.psk, hostname, pkgName, m.historyRequestID)
+}
+
+// updateSyncError folds the per-server failures into one header message.
+func (m *model) updateSyncError() {
+	if len(m.syncIssues) == 0 {
+		m.syncError = ""
+		return
+	}
+	names := make([]string, 0, len(m.syncIssues))
+	for server := range m.syncIssues {
+		names = append(names, server)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s: %s", name, m.syncIssues[name]))
+	}
+	m.syncError = strings.Join(parts, " | ")
+}
+
+// applyWindowSize keeps every viewport in sync, including while a modal is
+// open. Previously resizing only refreshed the main table.
+func (m *model) applyWindowSize(w, h int) {
+	m.width, m.height, m.ready = w, h, true
+
+	m.visibleLines = h - 14
+	if m.visibleLines < 1 {
+		m.visibleLines = 1
+	}
+	m.diffVisibleLines = h - 18
+	if m.diffVisibleLines < 3 {
+		m.diffVisibleLines = 3
+	}
+
+	m.updateViewport()
+	m.updateHistoryViewport()
+	m.updateHostHistoryViewport()
+	m.updatePackageHistoryViewport()
+	m.updateDiffViewport()
+	m.updateOSVModalViewport()
+}
+
+// cycleIndex moves through a small fixed set of tabs/inputs in either
+// direction without ever wrapping to a negative index.
+func cycleIndex(current, count int, backwards bool) int {
+	if count <= 0 {
+		return 0
+	}
+	if backwards {
+		return (current - 1 + count) % count
+	}
+	return (current + 1) % count
+}
+
+// fitModalWidth caps a preferred modal width to the available terminal width
+// instead of forcing a hard minimum that overflows small terminals.
+func (m *model) fitModalWidth(preferred, overhead int) int {
+	available := m.width - overhead
+	if available < 1 {
+		available = 1
+	}
+	if preferred > available {
+		return available
+	}
+	return preferred
 }
 
 func (m *model) switchFocus(target int) {
@@ -877,8 +997,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.hasOSV {
 			m.hasOSV = true
 		}
+		if msg.server != "" {
+			if m.syncIssues == nil {
+				m.syncIssues = make(map[string]string)
+			}
+			if msg.err != "" {
+				m.syncIssues[msg.server] = msg.err
+			} else {
+				delete(m.syncIssues, msg.server)
+			}
+			m.updateSyncError()
+		}
 		if msg.isDone {
 			m.loaded = true
+			m.updateSyncError()
 			m.sortData()
 			m.updateViewport()
 			return m, nil
@@ -895,6 +1027,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForUpdate(m.updateChan)
 
 	case historyDataMsg:
+		if msg.requestID != m.historyRequestID {
+			return m, nil
+		}
+		m.historyLoading = false
 		if msg.queryPkg != "" {
 			m.packageHistoryEvents = msg.events
 			m.selectedPkgHost = msg.queryHost
@@ -924,8 +1060,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case tea.WindowSizeMsg:
-			m.width = msg.Width
-			m.height = msg.Height
+			m.applyWindowSize(msg.Width, msg.Height)
 		}
 		return m, nil
 	}
@@ -960,8 +1095,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case tea.WindowSizeMsg:
-			m.width = msg.Width
-			m.height = msg.Height
+			m.applyWindowSize(msg.Width, msg.Height)
 		}
 		return m, nil
 	}
@@ -986,8 +1120,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case tea.WindowSizeMsg:
-			m.width = msg.Width
-			m.height = msg.Height
+			m.applyWindowSize(msg.Width, msg.Height)
 		}
 		return m, nil
 	}
@@ -1004,7 +1137,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if len(m.historyEvents) > 0 && m.historyCursor < len(m.historyEvents) {
 					evt := m.historyEvents[m.historyCursor]
-					return m, fetchHistoryCmd(m.servers, m.psk, evt.Hostname, evt.Package)
+					return m, m.requestHistory(evt.Hostname, evt.Package)
 				}
 				return m, nil
 
@@ -1030,9 +1163,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case tea.WindowSizeMsg:
-			m.width = msg.Width
-			m.height = msg.Height
-			m.updateHistoryViewport()
+			m.applyWindowSize(msg.Width, msg.Height)
 		}
 		return m, nil
 	}
@@ -1064,7 +1195,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if m.showHostModal && m.hostModalTab == 1 {
 					if len(m.hostHistoryEvents) > 0 && m.hostHistoryCursor < len(m.hostHistoryEvents) {
 						evt := m.hostHistoryEvents[m.hostHistoryCursor]
-						return m, fetchHistoryCmd(m.servers, m.psk, evt.Hostname, evt.Package)
+						return m, m.requestHistory(evt.Hostname, evt.Package)
 					}
 				} else {
 					m.showHostModal = false
@@ -1073,9 +1204,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "tab", "shift+tab":
 				if m.showHostModal {
-					m.hostModalTab = (m.hostModalTab + 1) % 2
+					m.hostModalTab = cycleIndex(m.hostModalTab, 2, msg.String() == "shift+tab")
 					if m.hostModalTab == 1 && len(m.hostHistoryEvents) == 0 {
-						return m, fetchHistoryCmd(m.servers, m.psk, m.selectedHost.Hostname, "")
+						return m, m.requestHistory(m.selectedHost.Hostname, "")
 					}
 				}
 				return m, nil
@@ -1095,8 +1226,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case tea.WindowSizeMsg:
-			m.width = msg.Width
-			m.height = msg.Height
+			m.applyWindowSize(msg.Width, msg.Height)
 		}
 		return m, nil
 	}
@@ -1111,7 +1241,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "tab", "shift+tab":
-				m.diffSelectFocused = (m.diffSelectFocused + 1) % 2
+				m.diffSelectFocused = cycleIndex(m.diffSelectFocused, 2, msg.String() == "shift+tab")
 				if m.diffSelectFocused == 0 {
 					m.diffHostAInput.Focus()
 					m.diffHostBInput.Blur()
@@ -1167,8 +1297,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case tea.WindowSizeMsg:
-			m.width = msg.Width
-			m.height = msg.Height
+			m.applyWindowSize(msg.Width, msg.Height)
 		}
 
 		if m.diffSelectFocused == 0 {
@@ -1218,13 +1347,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case tea.WindowSizeMsg:
-			m.width = msg.Width
-			m.height = msg.Height
-			m.diffVisibleLines = m.height - 18
-			if m.diffVisibleLines < 3 {
-				m.diffVisibleLines = 3
-			}
-			m.updateDiffViewport()
+			m.applyWindowSize(msg.Width, msg.Height)
 		}
 
 		prevQuery := m.diffFilterInput.Value()
@@ -1299,7 +1422,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+y":
 			m.showHistoryView = true
-			return m, fetchHistoryCmd(m.servers, m.psk, "", "")
+			return m, m.requestHistory("", "")
 		case "ctrl+s":
 			m.flashMsg = saveCSV(m.filtered)
 			return m, nil
@@ -1406,21 +1529,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.ready = true
-
-		reservedLines := 14
-		m.visibleLines = m.height - reservedLines
-		if m.visibleLines < 1 {
-			m.visibleLines = 1
-		}
-		m.updateViewport()
-
-		m.diffVisibleLines = m.height - 18
-		if m.diffVisibleLines < 3 {
-			m.diffVisibleLines = 3
-		}
+		m.applyWindowSize(msg.Width, msg.Height)
 	}
 
 	var hPrev, oPrev, pPrev, vPrev string
@@ -1482,9 +1591,7 @@ func (m *model) getFleetInsights() string {
 		if strings.EqualFold(item.PkgName, selectedPkg) {
 			hostMap[item.Hostname] = true
 			versionMap[item.Version] = true
-			if len(item.Vulnerabilities) > vulnCount {
-				vulnCount = len(item.Vulnerabilities)
-			}
+			vulnCount += len(item.Vulnerabilities)
 		}
 	}
 
@@ -1496,7 +1603,7 @@ func (m *model) getFleetInsights() string {
 
 	vulnText := ""
 	if m.hasOSV && vulnCount > 0 {
-		vulnText = fmt.Sprintf(" ⚠️ %d Vulnerability/CVE(s) flagged", vulnCount)
+		vulnText = fmt.Sprintf(" ⚠️ %d Vulnerability/CVE(s) flagged across those hosts", vulnCount)
 	}
 
 	return fmt.Sprintf("📊 Fleet Insights%s: '%s' is present on %d host(s) across %d unique version(s)%s",
@@ -1528,6 +1635,17 @@ func truncate(str string, maxLen int) string {
 		tail = strings.Repeat(".", maxLen)
 	}
 	return ansi.Truncate(str, maxLen, tail)
+}
+
+// modalHelpText keeps a long keyboard hint from widening a dialog beyond the
+// terminal. All modals are rendered inside a border plus three columns of
+// padding, so this leaves a comfortable margin.
+func (m *model) modalHelpText(text string) string {
+	width := m.width - 14
+	if width < 1 {
+		width = 1
+	}
+	return lipgloss.NewStyle().Foreground(cMuted).Render(truncate(text, width))
 }
 
 // distributeWidths splits a total width over relative weights, keeping a minimum
@@ -1579,18 +1697,12 @@ func (m model) View() string {
 
 	// 0. Keyboard Shortcuts Help Modal
 	if m.showHelpModal {
-		modalWidth := 74
-		if m.width-12 < modalWidth {
-			modalWidth = m.width - 12
-		}
-		if modalWidth < 52 {
-			modalWidth = 52
-		}
+		modalWidth := m.fitModalWidth(74, 12)
 
 		titleBar := titleBadge.Render(" ⌨️ KEYBOARD SHORTCUTS ")
 
-		colKeyW := 22
-		colDescW := modalWidth - colKeyW - 4
+		keyDescWidths := distributeWidths(modalWidth-4, []float64{0.32, 0.68}, 6)
+		colKeyW, colDescW := keyDescWidths[0], keyDescWidths[1]
 
 		hdrKey := tableHeaderStyle.Width(colKeyW).MaxWidth(colKeyW).Render(" SHORTCUT")
 		hdrDesc := tableHeaderStyle.Width(colDescW).MaxWidth(colDescW).Render(" ACTION / DESCRIPTION")
@@ -1640,7 +1752,7 @@ func (m model) View() string {
 
 		body := strings.Join(lines, "\n")
 		frame := panelStyle.BorderForeground(cPurple).Width(modalWidth + 2).Render(body)
-		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[Press Esc / Enter / F1 to close]")
+		helpText := m.modalHelpText("[Press Esc / Enter / F1 to close]")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -1656,13 +1768,7 @@ func (m model) View() string {
 
 	// 1. OSV Vulnerability Detail Modal (Strictly Bounded Width)
 	if m.showOSVModal {
-		modalContentWidth := m.width - 24
-		if modalContentWidth > 80 {
-			modalContentWidth = 80
-		}
-		if modalContentWidth < 50 {
-			modalContentWidth = 50
-		}
+		modalContentWidth := m.fitModalWidth(80, 24)
 
 		titleBar := titleBadge.Render(fmt.Sprintf(" 🛡 OSV ADVISORY: %s (%s) ", m.selectedOSVPkg, m.selectedOSVVer))
 
@@ -1718,7 +1824,7 @@ func (m model) View() string {
 		body := lipgloss.JoinVertical(lipgloss.Left, detailLines...)
 		frame := panelStyle.BorderForeground(cRed).Width(modalContentWidth).Render(body)
 
-		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼ / PgUp/PgDown] Scroll Advisories  |  [Esc / Enter] Close Pop-up")
+		helpText := m.modalHelpText("[▲/▼ / PgUp/PgDown] Scroll Advisories  |  [Esc / Enter] Close Pop-up")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -1734,16 +1840,18 @@ func (m model) View() string {
 
 	// 2. Per-Package Chronological Timeline Modal
 	if m.showPackageHistoryModal {
-		innerWidth := m.width - 12
-		if innerWidth < 70 {
-			innerWidth = 70
-		}
+		innerWidth := m.fitModalWidth(94, 14)
 
 		titleBar := titleBadge.Render(fmt.Sprintf(" 📦 PACKAGE TIMELINE: %s on %s ", m.selectedPkgName, m.selectedPkgHost))
 
-		colTimeW := 18
-		colActionW := 13
+		colTimeW, colActionW := 18, 13
+		if innerWidth < 45 {
+			colTimeW, colActionW = 10, 9
+		}
 		colVerW := innerWidth - colTimeW - colActionW
+		if colVerW < 4 {
+			colVerW = 4
+		}
 
 		hdrTime := tableHeaderStyle.Width(colTimeW).MaxWidth(colTimeW).Render(" TIMESTAMP")
 		hdrAction := tableHeaderStyle.Width(colActionW).MaxWidth(colActionW).Render(" ACTION")
@@ -1802,7 +1910,7 @@ func (m model) View() string {
 		historyBody := lipgloss.JoinVertical(lipgloss.Left, tableHdr, strings.Join(rowStrs, "\n"))
 		frame := panelStyle.BorderForeground(cPurple).Width(innerWidth + 4).Render(historyBody)
 
-		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Esc / Enter] Back to Previous View")
+		helpText := m.modalHelpText("[▲/▼] Scroll  |  [Esc / Enter] Back to Previous View")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -1834,22 +1942,15 @@ func (m model) View() string {
 
 	// 4. Fleet History View (Ctrl+Y)
 	if m.showHistoryView {
-		innerWidth := m.width - 10
-		if innerWidth < 90 {
-			innerWidth = 90
-		}
+		innerWidth := m.fitModalWidth(110, 14)
 
 		titleBar := titleBadge.Render(" 📜 FLEET AUDIT LOG / TIME TRAVEL ")
-
-		colTimeW := 18
-		colHostW := int(float64(innerWidth) * 0.28)
-		colActionW := 13
-		colPkgW := int(float64(innerWidth) * 0.25)
-		colVerW := innerWidth - colTimeW - colHostW - colActionW - colPkgW
-
-		if colVerW < 10 {
-			colVerW = 10
+		if m.historyLoading {
+			titleBar += " " + syncBadge.Render(" ⏳ LOADING ")
 		}
+
+		historyCols := distributeWidths(innerWidth, []float64{0.18, 0.27, 0.14, 0.24, 0.17}, 5)
+		colTimeW, colHostW, colActionW, colPkgW, colVerW := historyCols[0], historyCols[1], historyCols[2], historyCols[3], historyCols[4]
 
 		hdrTime := tableHeaderStyle.Width(colTimeW).MaxWidth(colTimeW).Render(" TIMESTAMP")
 		hdrHost := tableHeaderStyle.Width(colHostW).MaxWidth(colHostW).Render(" HOSTNAME")
@@ -1860,14 +1961,18 @@ func (m model) View() string {
 		tableHdr := lipgloss.JoinHorizontal(lipgloss.Left, hdrTime, hdrHost, hdrAction, hdrPkg, hdrVer)
 
 		start := m.historyOffset
-		end := m.historyOffset + m.visibleLines - 1
+		end := start + m.visibleLines
 		if end > len(m.historyEvents) {
 			end = len(m.historyEvents)
 		}
 
 		var rowStrs []string
 		if len(m.historyEvents) == 0 {
-			rowStrs = append(rowStrs, lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render(" No package change history recorded yet."))
+			emptyText := " No package change history recorded yet."
+			if m.historyLoading {
+				emptyText = " Loading history from daemons..."
+			}
+			rowStrs = append(rowStrs, lipgloss.NewStyle().Foreground(cMuted).Italic(true).Render(emptyText))
 		} else {
 			viewport := m.historyEvents[start:end]
 			for i, evt := range viewport {
@@ -1916,7 +2021,7 @@ func (m model) View() string {
 		historyBody := lipgloss.JoinVertical(lipgloss.Left, tableHdr, strings.Join(rowStrs, "\n"))
 		frame := panelStyle.BorderForeground(cPurple).Width(innerWidth + 4).Render(historyBody)
 
-		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[▲/▼] Scroll  |  [Enter] Inspect Full Package Timeline  |  [Esc / Ctrl+Y] Close History View")
+		helpText := m.modalHelpText("[▲/▼] Scroll  |  [Enter] Inspect Full Package Timeline  |  [Esc / Ctrl+Y] Close History View")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -1961,10 +2066,7 @@ func (m model) View() string {
 
 		hostTitle := fmt.Sprintf(" HOST: %s ", m.selectedHost.Hostname)
 
-		modalInnerWidth := m.width - 20
-		if modalInnerWidth < 74 {
-			modalInnerWidth = 74
-		}
+		modalInnerWidth := m.fitModalWidth(74, 20)
 
 		lblStyle := labelFocused.Width(16)
 
@@ -2056,6 +2158,7 @@ func (m model) View() string {
 		if len(m.selectedHost.Vulnerabilities) > 0 {
 			helpBar = "[Ctrl+A] View OSV Advisory  |  " + helpBar
 		}
+		helpBar = truncate(helpBar, modalInnerWidth)
 
 		modalContent := lipgloss.JoinVertical(lipgloss.Left,
 			lipgloss.NewStyle().Width(modalInnerWidth).Align(lipgloss.Center).Render(titleBadge.Render(hostTitle)),
@@ -2116,7 +2219,7 @@ func (m model) View() string {
 			formatSuggestions(matchesB),
 		)
 
-		helpText := lipgloss.NewStyle().Foreground(cMuted).Render("[Tab] Switch Field  |  [Enter] Compare Top Match  |  [Esc] Cancel")
+		helpText := m.modalHelpText("[Tab] Switch Field  |  [Enter] Compare Top Match  |  [Esc] Cancel")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -2134,24 +2237,24 @@ func (m model) View() string {
 
 	// 7. Diff View Modal
 	if m.showDiffViewModal {
-		modalOuterW := m.width - 10
-		if modalOuterW < 70 {
-			modalOuterW = 70
-		}
+		modalOuterW := m.fitModalWidth(110, 10)
 
 		panelOuterW := (modalOuterW - 9) / 2
-		panelInnerW := panelOuterW - 4
-		if panelInnerW < 20 {
-			panelInnerW = 20
-			panelOuterW = panelInnerW + 4
+		if panelOuterW < 5 {
+			panelOuterW = 5
 		}
+		panelInnerW := panelOuterW - 4
 
 		pkgColW := int(float64(panelInnerW) * 0.58)
 		verColW := panelInnerW - pkgColW
 
 		titleBar := titleBadge.Render(fmt.Sprintf(" ⚔️ DIFF: %s vs %s ", m.selectedHostA, m.selectedHostB))
 
-		m.diffFilterInput.Width = modalOuterW - 20
+		filterWidth := modalOuterW - 20
+		if filterWidth < 4 {
+			filterWidth = 4
+		}
+		m.diffFilterInput.Width = filterWidth
 		searchLine := lipgloss.JoinHorizontal(lipgloss.Left,
 			labelFocused.Render("❯ Filter: "),
 			m.diffFilterInput.View(),
@@ -2259,7 +2362,7 @@ func (m model) View() string {
 		statsText := fmt.Sprintf("📊 Comparison: %d differences out of %d total packages  |  Mode: %s", diffCount, len(m.diffAllItems), modeTag)
 		stats := insightBoxStyle.Render(truncate(statsText, modalOuterW-8))
 
-		help := lipgloss.NewStyle().Foreground(cMuted).Render("[Ctrl+T] Toggle Diffs Only  |  [Filter] Search  |  [▲/▼] Scroll  |  [Esc] Close")
+		help := m.modalHelpText("[Ctrl+T] Toggle Diffs Only  |  [Filter] Search  |  [▲/▼] Scroll  |  [Esc] Close")
 
 		content := lipgloss.JoinVertical(lipgloss.Center,
 			titleBar,
@@ -2308,9 +2411,12 @@ func (m model) View() string {
 	}
 
 	var stBadge string
-	if !m.loaded {
+	switch {
+	case !m.loaded:
 		stBadge = syncBadge.Render(" ⚡ STREAMING ")
-	} else {
+	case m.syncError != "":
+		stBadge = syncErrBadge.Render(" ⚠ PARTIAL SYNC ")
+	default:
 		stBadge = readyBadge.Render(" ✓ SYNCED ")
 	}
 
@@ -2328,8 +2434,12 @@ func (m model) View() string {
 
 	leftBadges := strings.Join(leftBadgesList, " ")
 	rightMeta := mText
-	if m.flashMsg != "" {
-		rightMeta = flashStyle.Render(m.flashMsg) + " " + mText
+	statusMsg, statusStyle := m.flashMsg, flashStyle
+	if statusMsg == "" && m.syncError != "" {
+		statusMsg, statusStyle = m.syncError, lipgloss.NewStyle().Foreground(cPink)
+	}
+	if statusMsg != "" {
+		rightMeta = statusStyle.Render(statusMsg) + " " + mText
 	}
 
 	leftWidth := lipgloss.Width(leftBadges)
