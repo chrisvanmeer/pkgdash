@@ -128,6 +128,7 @@ func main() {
 	mux.HandleFunc("/modal/timeline", handleTimelineModal)
 	mux.HandleFunc("/modal/diff", handleDiffModal)
 	mux.HandleFunc("/modal/osv", handleOSVModal)
+	mux.HandleFunc("/modal/osv/latest", handleLatestOSVModal)
 	mux.HandleFunc("/diff/results", handleDiffResults)
 	mux.HandleFunc("/export/csv", handleExportCSV)
 	mux.HandleFunc("/export/ini", handleExportINI)
@@ -427,9 +428,7 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 	for _, item := range filtered {
 		hostMap[item.Hostname] = true
 		verMap[item.Version] = true
-		if len(item.Vulnerabilities) > vulnCount {
-			vulnCount = len(item.Vulnerabilities)
-		}
+		vulnCount += len(item.Vulnerabilities)
 	}
 	return filtered, len(hostMap), len(verMap), vulnCount
 }
@@ -519,15 +518,23 @@ func handleHostModal(w http.ResponseWriter, r *http.Request) {
 	hostname := r.URL.Query().Get("h")
 	pkgName := r.URL.Query().Get("p")
 	var host FlatItem
+	found := false
 	dataMutex.RLock()
 	hasOSV := hasOSVGlobal
 	for _, item := range globalItems {
 		if item.Hostname == hostname && (pkgName == "" || item.PkgName == pkgName) {
 			host = item
+			found = true
 			break
 		}
 	}
+	syncErr := syncError
 	dataMutex.RUnlock()
+
+	if !found {
+		writeModalMessage(w, "Host or package not found", "This record is no longer in the cached data. Refresh the page and try again.", syncErr)
+		return
+	}
 
 	vulnSummary := "None detected"
 	if minSevConfig > 0 {
@@ -580,7 +587,27 @@ func handlePackageHistoryModal(w http.ResponseWriter, r *http.Request) {
 
 func handleTimelineModal(w http.ResponseWriter, r *http.Request) {
 	events := fetchHistoryFromDaemons("", "")
+	if len(events) == 0 {
+		dataMutex.RLock()
+		syncErr := syncError
+		dataMutex.RUnlock()
+		_, _ = w.Write([]byte(`<div class="modal-header"><span class="badge bg-purple"> 📜 FLEET AUDIT LOG / TIME TRAVEL </span></div>` +
+			`<div style="text-align:center; padding: 2rem; color:var(--muted); font-style:italic;">No package change events recorded yet across the fleet.</div>`))
+		if syncErr != "" {
+			_, _ = fmt.Fprintf(w, `<div style="text-align:center; color:var(--pink);">%s</div>`, template.HTMLEscapeString(syncErr))
+		}
+		return
+	}
 	_ = tmpl.ExecuteTemplate(w, "modal_timeline", events)
+}
+
+// writeModalMessage renders a consistent empty/error state inside a dialog.
+func writeModalMessage(w http.ResponseWriter, title, detail, syncErr string) {
+	_, _ = fmt.Fprintf(w, `<div class="modal-header"><span class="badge bg-purple"> %s </span></div>`, template.HTMLEscapeString(title))
+	_, _ = fmt.Fprintf(w, `<div style="text-align:center; padding: 2rem; color:var(--muted); font-style:italic;">%s</div>`, template.HTMLEscapeString(detail))
+	if syncErr != "" {
+		_, _ = fmt.Fprintf(w, `<div style="text-align:center; color:var(--pink);">%s</div>`, template.HTMLEscapeString(syncErr))
+	}
 }
 
 func handleOSVModal(w http.ResponseWriter, r *http.Request) {
@@ -588,14 +615,22 @@ func handleOSVModal(w http.ResponseWriter, r *http.Request) {
 	pkgName := r.URL.Query().Get("p")
 
 	var selectedItem FlatItem
+	found := false
 	dataMutex.RLock()
+	syncErr := syncError
 	for _, item := range globalItems {
 		if item.Hostname == hostname && item.PkgName == pkgName {
 			selectedItem = item
+			found = true
 			break
 		}
 	}
 	dataMutex.RUnlock()
+
+	if !found {
+		writeModalMessage(w, "OSV ADVISORY", "This record is no longer in the cached data. Refresh the page and try again.", syncErr)
+		return
+	}
 
 	_ = tmpl.ExecuteTemplate(w, "modal_osv", map[string]interface{}{
 		"Hostname":        hostname,
@@ -603,6 +638,24 @@ func handleOSVModal(w http.ResponseWriter, r *http.Request) {
 		"Version":         selectedItem.Version,
 		"Vulnerabilities": selectedItem.Vulnerabilities,
 	})
+}
+
+// handleLatestOSVModal serves Ctrl+A: the first vulnerable package in the
+// currently filtered view, without requiring a mouse selection.
+func handleLatestOSVModal(w http.ResponseWriter, r *http.Request) {
+	filtered, _, _, _ := filterAndSort(r)
+	for _, item := range filtered {
+		if len(item.Vulnerabilities) > 0 {
+			_ = tmpl.ExecuteTemplate(w, "modal_osv", map[string]interface{}{
+				"Hostname":        item.Hostname,
+				"Package":         item.PkgName,
+				"Version":         item.Version,
+				"Vulnerabilities": item.Vulnerabilities,
+			})
+			return
+		}
+	}
+	writeModalMessage(w, "OSV ADVISORY", "No vulnerable packages match the current filters.", "")
 }
 
 func handleDiffModal(w http.ResponseWriter, r *http.Request) {
@@ -909,13 +962,14 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     <!-- Footer -->
     <div class="footer">
         <div>
-            <a class="btn-link" onclick="document.getElementById('aboutModal').showModal()">[About]</a> |
-            <a class="btn-link" hx-get="/modal/timeline" hx-target="#timeline-dialog-content" onclick="document.getElementById('timelineModal').showModal()">[Ctrl+Y] Timeline</a> |
-            <a class="btn-link" hx-get="/modal/diff" hx-target="#diff-dialog-content" onclick="document.getElementById('diffModal').showModal()">[Ctrl+D] Diff</a> |
+            <a class="btn-link" onclick="openDialog('aboutModal')">[About]</a> |
+            <a class="btn-link" hx-get="/modal/timeline" hx-target="#timeline-dialog-content" onclick="openDialog('timelineModal')">[Ctrl+Y] Timeline</a> |
+            <a class="btn-link" hx-get="/modal/diff" hx-target="#diff-dialog-content" onclick="openDialog('diffModal')">[Ctrl+D] Diff</a> |
             <a class="btn-link" href="#" onclick="exportFile('/export/ini')">[Ctrl+E] Export INI</a> |
             <a class="btn-link" href="#" onclick="exportFile('/export/csv')">[Ctrl+S] Export CSV</a>
             {{if .HasOSV}}
             | <a class="btn-link" href="#" id="vuln-toggle-btn" onclick="toggleVulns()">[Ctrl+U] Vulns Only</a>
+            | <a class="btn-link" href="#" onclick="openModal('/modal/osv/latest', 'osv-dialog-content', 'osvModal')">[Ctrl+A] OSV</a>
             {{end}}
         </div>
         <div id="record-count">Records: 0 / 0</div>
@@ -929,30 +983,43 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             High-Performance Fleet Package Inventory (Web Edition)<br>
             <span class="text-muted">© 2026 • All rights reserved</span>
         </div>
+        <div style="max-height: 260px; overflow-y: auto; text-align: left; margin-bottom: 1.5rem;">
+            <span class="text-pink" style="font-weight:bold;">Keyboard shortcuts</span>
+            <table style="width:100%; font-size:13px;"><tbody>
+                <tr><td>Ctrl+Y</td><td>Fleet audit log / timeline</td></tr>
+                <tr><td>Ctrl+D</td><td>Host package diff</td></tr>
+                <tr><td>Ctrl+T</td><td>Toggle diff-only (while diff dialog is open)</td></tr>
+                <tr><td>Ctrl+A</td><td>First OSV advisory in view</td></tr>
+                <tr><td>Ctrl+U</td><td>Toggle vulnerable packages only</td></tr>
+                <tr><td>Ctrl+O</td><td>Sort by OS / version</td></tr>
+                <tr><td>Ctrl+H / P / V</td><td>Sort by hostname / package / version</td></tr>
+                <tr><td>Ctrl+S / E</td><td>Export CSV / INI</td></tr>
+            </tbody></table>
+        </div>
         <div style="text-align: center;"><button type="button" onclick="this.closest('dialog').close()">[Close]</button></div>
     </dialog>
 
     <dialog id="hostModal">
-        <div id="host-dialog-content"></div>
+        <div id="host-dialog-content"><div style="text-align:center; padding:2rem; color:var(--muted); font-style:italic;">Loading…</div></div>
         <div style="text-align: center; margin-top: 1rem;"><button type="button" onclick="this.closest('dialog').close()">[Close]</button></div>
     </dialog>
 
     <dialog id="osvModal">
-        <div id="osv-dialog-content"></div>
+        <div id="osv-dialog-content"><div style="text-align:center; padding:2rem; color:var(--muted); font-style:italic;">Loading…</div></div>
         <div style="text-align: center; margin-top: 1rem;"><button type="button" onclick="this.closest('dialog').close()">[Close]</button></div>
     </dialog>
 
     <dialog id="packageHistoryModal">
-        <div id="pkg-history-dialog-content"></div>
+        <div id="pkg-history-dialog-content"><div style="text-align:center; padding:2rem; color:var(--muted); font-style:italic;">Loading…</div></div>
         <div style="text-align: center; margin-top: 1rem;"><button type="button" onclick="this.closest('dialog').close()">[Close]</button></div>
     </dialog>
 
     <dialog id="diffModal">
-        <div id="diff-dialog-content"></div>
+        <div id="diff-dialog-content"><div style="text-align:center; padding:2rem; color:var(--muted); font-style:italic;">Loading…</div></div>
     </dialog>
 
     <dialog id="timelineModal">
-        <div id="timeline-dialog-content"></div>
+        <div id="timeline-dialog-content"><div style="text-align:center; padding:2rem; color:var(--muted); font-style:italic;">Loading…</div></div>
         <div style="text-align: center; margin-top: 1rem;"><button type="button" onclick="this.closest('dialog').close()">[Close]</button></div>
     </dialog>
 
@@ -978,41 +1045,71 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             htmx.ajax('GET', '/table', {target: '#table-container', source: '#filter-form'});
         }
 
-        // Global Keyboard Shortcuts (Ctrl+Y, Ctrl+D, Ctrl+S, Ctrl+E, Ctrl+U)
+        // openDialog is idempotent: calling showModal() on an already-open
+        // dialog throws InvalidStateError when the user double-clicks.
+        function openDialog(id) {
+            const dialog = document.getElementById(id);
+            if (dialog && !dialog.open) {
+                dialog.showModal();
+            }
+        }
+
+        function openModal(endpoint, targetId, dialogId) {
+            htmx.ajax('GET', endpoint, {target: '#' + targetId, source: '#filter-form'});
+            openDialog(dialogId);
+        }
+
+        function anyDialogOpen() {
+            return Array.from(document.querySelectorAll('dialog')).some(d => d.open);
+        }
+
+        function isTyping(target) {
+            if (!target) return false;
+            if (target.isContentEditable) return true;
+            return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName);
+        }
+
+        function sortBy(col) {
+            const sortInput = document.getElementById('sort-col');
+            const descInput = document.getElementById('sort-desc');
+            if (sortInput.value === col) {
+                descInput.value = descInput.value === 'true' ? 'false' : 'true';
+            } else {
+                sortInput.value = col;
+                descInput.value = 'false';
+            }
+            htmx.ajax('GET', '/table', {target: '#table-container', source: '#filter-form'});
+        }
+
+        // Global Keyboard Shortcuts. They never fire while typing or while a
+        // dialog is open, except Ctrl+T inside the diff dialog.
         document.addEventListener('keydown', function(e) {
-            if (e.ctrlKey || e.metaKey) {
-                const key = e.key.toLowerCase();
-                if (key === 'y') {
-                    e.preventDefault();
-                    htmx.ajax('GET', '/modal/timeline', {target: '#timeline-dialog-content'});
-                    document.getElementById('timelineModal').showModal();
-                } else if (key === 'd') {
-                    e.preventDefault();
-                    htmx.ajax('GET', '/modal/diff', {target: '#diff-dialog-content'});
-                    document.getElementById('diffModal').showModal();
-                } else if (key === 's') {
-                    e.preventDefault();
-                    exportFile('/export/csv');
-                } else if (key === 'e') {
-                    e.preventDefault();
-                    exportFile('/export/ini');
-                } else if (key === 'u') {
-                    e.preventDefault();
-                    if (document.getElementById('vulnOnlyHidden')) {
-                        toggleVulns();
-                    }
-                } else if (key === 'o') {
-                    e.preventDefault();
-                    const sortInput = document.getElementById('sort-col');
-                    const descInput = document.getElementById('sort-desc');
-                    if (sortInput.value === 'os') {
-                        descInput.value = descInput.value === 'true' ? 'false' : 'true';
-                    } else {
-                        sortInput.value = 'os';
-                        descInput.value = 'false';
-                    }
-                    htmx.ajax('GET', '/table', {target: '#table-container', source: '#filter-form'});
+            if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+            const key = e.key.toLowerCase();
+            const diff = document.getElementById('diffModal');
+
+            if (key === 't' && diff && diff.open) {
+                e.preventDefault();
+                const box = diff.querySelector('input[name="diffOnly"]');
+                if (box) {
+                    box.checked = !box.checked;
+                    htmx.trigger(box, 'change');
                 }
+                return;
+            }
+            if (isTyping(e.target) || anyDialogOpen()) return;
+
+            switch (key) {
+                case 'y': e.preventDefault(); openModal('/modal/timeline', 'timeline-dialog-content', 'timelineModal'); break;
+                case 'd': e.preventDefault(); openModal('/modal/diff', 'diff-dialog-content', 'diffModal'); break;
+                case 'a': e.preventDefault(); openModal('/modal/osv/latest', 'osv-dialog-content', 'osvModal'); break;
+                case 's': e.preventDefault(); exportFile('/export/csv'); break;
+                case 'e': e.preventDefault(); exportFile('/export/ini'); break;
+                case 'u': e.preventDefault(); if (document.getElementById('vulnOnlyHidden')) toggleVulns(); break;
+                case 'o': e.preventDefault(); sortBy('os'); break;
+                case 'h': e.preventDefault(); sortBy('host'); break;
+                case 'p': e.preventDefault(); sortBy('pkg'); break;
+                case 'v': e.preventDefault(); sortBy('ver'); break;
             }
         });
 
@@ -1078,7 +1175,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
     {{$hasOSV := .HasOSV}}
     {{range .Items}}
     {{$hasVuln := and $hasOSV .Vulnerabilities}}
-    <tr {{if $hasVuln}}class="vuln-row"{{end}} hx-get="/modal/host?h={{urlquery .Hostname}}&p={{urlquery .PkgName}}" hx-target="#host-dialog-content" onclick="document.getElementById('hostModal').showModal()">
+    <tr {{if $hasVuln}}class="vuln-row"{{end}} hx-get="/modal/host?h={{urlquery .Hostname}}&p={{urlquery .PkgName}}" hx-target="#host-dialog-content" onclick="openDialog('hostModal')">
         <td>  {{.Hostname}}</td>
         <td>{{osLabel .OSName .OSVersion}}</td>
         <td>{{.PkgName}}</td>
@@ -1116,14 +1213,14 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         <div><span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Host Function:</span> {{if .Host.HostFunction}}{{.Host.HostFunction}}{{else}}-{{end}}</div>
         <div>
             <span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Package:</span> {{.Host.PkgName}} {{.Host.Version}}
-            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/package/history?h={{urlquery .Host.Hostname}}&p={{urlquery .Host.PkgName}}" hx-target="#pkg-history-dialog-content" onclick="document.getElementById('packageHistoryModal').showModal();">[View Package Timeline]</button>
+            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/package/history?h={{urlquery .Host.Hostname}}&p={{urlquery .Host.PkgName}}" hx-target="#pkg-history-dialog-content" onclick="openDialog('packageHistoryModal');">[View Package Timeline]</button>
         </div>
         {{if .HasOSV}}
         <div>
             <span class="text-pink" style="font-weight:bold; display:inline-block; width: 140px;">Security/CVE:</span> 
             <span class="text-red">{{.VulnSummary}}</span>
             {{if .Host.Vulnerabilities}}
-            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/osv?h={{urlquery .Host.Hostname}}&p={{urlquery .Host.PkgName}}" hx-target="#osv-dialog-content" onclick="document.getElementById('osvModal').showModal();">[View OSV Advisory]</button>
+            <button type="button" style="margin-left: 1rem; padding: 0.2rem 0.6rem; font-size: 12px;" hx-get="/modal/osv?h={{urlquery .Host.Hostname}}&p={{urlquery .Host.PkgName}}" hx-target="#osv-dialog-content" onclick="openDialog('osvModal');">[View OSV Advisory]</button>
             {{end}}
         </div>
         {{end}}
@@ -1174,7 +1271,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
         </thead>
         <tbody>
             {{range .Events}}
-            <tr hx-get="/modal/package/history?h={{urlquery $.Hostname}}&p={{urlquery .Package}}" hx-target="#pkg-history-dialog-content" onclick="document.getElementById('packageHistoryModal').showModal()">
+            <tr hx-get="/modal/package/history?h={{urlquery $.Hostname}}&p={{urlquery .Package}}" hx-target="#pkg-history-dialog-content" onclick="openDialog('packageHistoryModal')">
                 <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
                 <td>
                     {{if eq .Action "ADDED"}}<span class="badge bg-green">+ ADDED</span>
@@ -1216,7 +1313,7 @@ var tmpl = template.Must(template.New("").Funcs(template.FuncMap{
             </thead>
             <tbody>
                 {{range .}}
-                <tr hx-get="/modal/package/history?h={{.Hostname}}&p={{.Package}}" hx-target="#pkg-history-dialog-content" onclick="document.getElementById('packageHistoryModal').showModal()">
+                <tr hx-get="/modal/package/history?h={{urlquery .Hostname}}&p={{urlquery .Package}}" hx-target="#pkg-history-dialog-content" onclick="openDialog('packageHistoryModal')">
                     <td style="color:var(--muted);">{{formatTime .Timestamp}}</td>
                     <td class="text-cyan" style="font-weight:bold;">{{.Hostname}}</td>
                     <td>
