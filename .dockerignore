@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+*.md
+*.pem
+*.key
+*.env
+pkgdash.config
+pkgdash
+pkgdashd
+pkgdash-web
+dist/

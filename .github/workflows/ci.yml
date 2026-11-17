@@ -37,7 +37,11 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+      - name: Test
+        run: go test -race ./...
+
       - name: Build binaries
         run: |
           go build -v ./cmd/pkgdash
           go build -v ./cmd/pkgdashd
+          go build -v ./cmd/pkgdash-web

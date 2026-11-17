@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"compress/gzip"
 	"crypto/tls"
-	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,71 +10,24 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/dlclark/regexp2"
+	"pkgdash-project/internal/pkgdash"
 )
 
-type Vulnerability struct {
-	ID       string   `json:"id"`
-	CVE      []string `json:"cve,omitempty"`
-	Summary  string   `json:"summary,omitempty"`
-	Details  string   `json:"details,omitempty"`
-	URL      string   `json:"url,omitempty"`
-	Severity float64  `json:"severity,omitempty"`
-}
-
-type PackageInfo struct {
-	Name            string          `json:"name"`
-	Version         string          `json:"version"`
-	Arch            string          `json:"arch"`
-	Vulnerabilities []Vulnerability `json:"vulnerabilities,omitempty"`
-}
-
-type HostPayload struct {
-	Hostname     string        `json:"hostname"`
-	IPAddress    string        `json:"ip_address,omitempty"`
-	OSName       string        `json:"os_name,omitempty"`
-	OSVersion    string        `json:"os_version,omitempty"`
-	HostFunction string        `json:"host_function,omitempty"`
-	Packages     []PackageInfo `json:"packages"`
-	OSVEnabled   bool          `json:"osv_enabled"`
-}
-
-type FlatItem struct {
-	Hostname        string
-	IPAddress       string
-	OSName          string
-	OSVersion       string
-	HostFunction    string
-	PkgName         string
-	Version         string
-	Arch            string
-	Vulnerabilities []Vulnerability
-	OSVEnabled      bool
-}
-
-type DiffRow struct {
-	PkgName  string
-	VersionA string
-	VersionB string
-	IsDiff   bool
-}
-
-type ChangeEvent struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Hostname   string    `json:"hostname"`
-	Package    string    `json:"package"`
-	OldVersion string    `json:"old_version,omitempty"`
-	NewVersion string    `json:"new_version,omitempty"`
-	Action     string    `json:"action"` // "ADDED", "REMOVED", "MODIFIED"
-}
+// Domain types live in the shared package so the web UI and TUI cannot drift.
+type (
+	Vulnerability = pkgdash.Vulnerability
+	PackageInfo   = pkgdash.PackageInfo
+	HostPayload   = pkgdash.HostPayload
+	FlatItem      = pkgdash.FlatItem
+	DiffRow       = pkgdash.DiffRow
+	ChangeEvent   = pkgdash.ChangeEvent
+)
 
 var (
 	globalItems   []FlatItem
@@ -94,7 +45,9 @@ func main() {
 	flagPort := flag.String("port", "", "Web server port")
 	flag.Parse()
 
-	serversConfig, pskConfig, minSevConfig = getConfig()
+	cfg := pkgdash.LoadClientConfig()
+	serversConfig, pskConfig, minSevConfig = cfg.Servers, cfg.PSK, cfg.MinSeverity
+	webPort = cfg.WebPort
 
 	if *flagMinSev >= 0 {
 		minSevConfig = *flagMinSev
@@ -141,67 +94,6 @@ func main() {
 
 	fmt.Printf("🚀 Starting pkgdash-web on http://localhost%s (Min CVSS Severity: %s)\n", webPort, minSevMsg)
 	log.Fatal(http.ListenAndServe(webPort, nil))
-}
-
-func getConfig() ([]string, string, float64) {
-	var servers []string
-	psk := os.Getenv("PKGDASH_PSK")
-	minSev := 0.0
-
-	if envMinSev := os.Getenv("PKGDASH_MIN_SEVERITY"); envMinSev != "" {
-		if v, err := strconv.ParseFloat(envMinSev, 64); err == nil {
-			minSev = v
-		}
-	}
-
-	if envServers := os.Getenv("PKGDASH_SERVERS"); envServers != "" {
-		servers = strings.Split(envServers, ",")
-	}
-	if envPort := os.Getenv("PKGDASH_WEB_PORT"); envPort != "" {
-		if !strings.HasPrefix(envPort, ":") {
-			webPort = ":" + envPort
-		} else {
-			webPort = envPort
-		}
-	}
-
-	home, err := os.UserHomeDir()
-	if err == nil {
-		cfgPath := filepath.Join(home, ".local", "pkgdash.config")
-		if file, err := os.Open(cfgPath); err == nil {
-			defer func() { _ = file.Close() }()
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" || strings.HasPrefix(line, "#") {
-					continue
-				}
-
-				if strings.HasPrefix(strings.ToLower(line), "psk=") {
-					if psk == "" {
-						psk = line[4:]
-					}
-				} else if strings.HasPrefix(strings.ToLower(line), "min_severity=") {
-					if os.Getenv("PKGDASH_MIN_SEVERITY") == "" {
-						if v, err := strconv.ParseFloat(line[13:], 64); err == nil {
-							minSev = v
-						}
-					}
-				} else if strings.HasPrefix(strings.ToLower(line), "web_port=") {
-					portVal := line[9:]
-					if !strings.HasPrefix(portVal, ":") {
-						webPort = ":" + portVal
-					} else {
-						webPort = portVal
-					}
-				} else if len(servers) == 0 {
-					servers = append(servers, line)
-				}
-			}
-			_ = scanner.Err()
-		}
-	}
-	return servers, psk, minSev
 }
 
 func fetchAllData(servers []string, psk string) {
@@ -410,73 +302,33 @@ func filterAndSort(r *http.Request) ([]FlatItem, int, int, int) {
 	dataMutex.RLock()
 	defer dataMutex.RUnlock()
 
-	hostQuery := strings.TrimSpace(r.URL.Query().Get("host"))
-	osQuery := strings.TrimSpace(r.URL.Query().Get("os"))
-	pkgQuery := strings.TrimSpace(r.URL.Query().Get("pkg"))
-	verQuery := strings.TrimSpace(r.URL.Query().Get("ver"))
-	vulnOnly := r.URL.Query().Get("vulnOnly") == "true"
+	filtered := pkgdash.Filter(
+		globalItems,
+		r.URL.Query().Get("host"),
+		r.URL.Query().Get("os"),
+		r.URL.Query().Get("pkg"),
+		r.URL.Query().Get("ver"),
+		r.URL.Query().Get("vulnOnly") == "true",
+	)
 
-	hMatch := createFieldMatcher(hostQuery)
-	oMatch := createFieldMatcher(osQuery)
-	pMatch := createFieldMatcher(pkgQuery)
-	vMatch := createFieldMatcher(verQuery)
+	fields := map[string]pkgdash.SortField{
+		"os":  pkgdash.SortOS,
+		"pkg": pkgdash.SortPkg,
+		"ver": pkgdash.SortVer,
+	}
+	field := fields[r.URL.Query().Get("sort")]
+	pkgdash.SortItems(filtered, field, r.URL.Query().Get("desc") == "true")
 
-	var filtered []FlatItem
 	hostMap := make(map[string]bool)
 	verMap := make(map[string]bool)
 	vulnCount := 0
-
-	for _, item := range globalItems {
-		if vulnOnly && len(item.Vulnerabilities) == 0 {
-			continue
-		}
-		if hMatch(item.Hostname) && oMatch(osLabel(item.OSName, item.OSVersion)) && pMatch(item.PkgName) && vMatch(item.Version) {
-			filtered = append(filtered, item)
-			hostMap[item.Hostname] = true
-			verMap[item.Version] = true
-			if len(item.Vulnerabilities) > vulnCount {
-				vulnCount = len(item.Vulnerabilities)
-			}
+	for _, item := range filtered {
+		hostMap[item.Hostname] = true
+		verMap[item.Version] = true
+		if len(item.Vulnerabilities) > vulnCount {
+			vulnCount = len(item.Vulnerabilities)
 		}
 	}
-
-	sortCol := r.URL.Query().Get("sort")
-	sortDesc := r.URL.Query().Get("desc") == "true"
-
-	sort.Slice(filtered, func(i, j int) bool {
-		a, b := filtered[i], filtered[j]
-		ah, bh := strings.ToLower(a.Hostname), strings.ToLower(b.Hostname)
-		ao, bo := strings.ToLower(osLabel(a.OSName, a.OSVersion)), strings.ToLower(osLabel(b.OSName, b.OSVersion))
-		ap, bp := strings.ToLower(a.PkgName), strings.ToLower(b.PkgName)
-		av, bv := a.Version, b.Version
-
-		var primaryLess, primaryEqual bool
-		switch sortCol {
-		case "os":
-			primaryLess, primaryEqual = ao < bo, ao == bo
-		case "pkg":
-			primaryLess, primaryEqual = ap < bp, ap == bp
-		case "ver":
-			primaryLess, primaryEqual = av < bv, av == bv
-		default:
-			primaryLess, primaryEqual = ah < bh, ah == bh
-		}
-
-		if primaryEqual {
-			if ah != bh {
-				return ah < bh
-			}
-			if ap != bp {
-				return ap < bp
-			}
-			return av < bv
-		}
-		if sortDesc {
-			return !primaryLess
-		}
-		return primaryLess
-	})
-
 	return filtered, len(hostMap), len(verMap), vulnCount
 }
 
@@ -664,60 +516,32 @@ func handleDiffResults(w http.ResponseWriter, r *http.Request) {
 	filter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("filter")))
 	diffOnly := r.URL.Query().Get("diffOnly") == "on"
 
-	if hostA == "" || hostB == "" || hostA == hostB {
+	if hostA == "" || hostB == "" || strings.EqualFold(hostA, hostB) {
 		_, _ = w.Write([]byte(`<div class="text-pink text-center mt-3" style="text-align:center; margin-top:1rem;">Please select two different hosts.</div>`))
 		return
 	}
 
-	pkgsA, pkgsB := make(map[string]string), make(map[string]string)
-	allPkgs := make(map[string]bool)
-
 	dataMutex.RLock()
-	for _, item := range globalItems {
-		if strings.EqualFold(item.Hostname, hostA) {
-			pkgsA[item.PkgName] = item.Version
-			allPkgs[item.PkgName] = true
-		}
-		if strings.EqualFold(item.Hostname, hostB) {
-			pkgsB[item.PkgName] = item.Version
-			allPkgs[item.PkgName] = true
-		}
-	}
+	allRows := pkgdash.BuildDiffData(hostA, hostB, globalItems)
 	dataMutex.RUnlock()
 
-	var pNames []string
-	for p := range allPkgs {
-		pNames = append(pNames, p)
-	}
-	sort.Strings(pNames)
-
+	matcher := pkgdash.NewMatcher(filter)
 	var rows []DiffRow
 	diffCount := 0
-	for _, name := range pNames {
-		vA, hasA := pkgsA[name]
-		if !hasA {
-			vA = "-"
-		}
-		vB, hasB := pkgsB[name]
-		if !hasB {
-			vB = "-"
-		}
-		isDiff := vA != vB
-		if isDiff {
+	for _, row := range allRows {
+		if row.IsDiff {
 			diffCount++
 		}
-
-		if diffOnly && !isDiff {
+		if diffOnly && !row.IsDiff {
 			continue
 		}
-		if filter != "" && !strings.Contains(strings.ToLower(name), filter) && !strings.Contains(strings.ToLower(vA), filter) && !strings.Contains(strings.ToLower(vB), filter) {
+		if !matcher(row.PkgName) && !matcher(row.VersionA) && !matcher(row.VersionB) {
 			continue
 		}
-
-		rows = append(rows, DiffRow{PkgName: name, VersionA: vA, VersionB: vB, IsDiff: isDiff})
+		rows = append(rows, row)
 	}
 
-	stats := fmt.Sprintf("📊 Comparison: %d differences out of %d total packages", diffCount, len(allPkgs))
+	stats := fmt.Sprintf("📊 Comparison: %d differences out of %d total packages", diffCount, len(allRows))
 
 	_ = tmpl.ExecuteTemplate(w, "diff_table", map[string]interface{}{
 		"HostA": hostA, "HostB": hostB, "Rows": rows, "Stats": stats,
@@ -726,80 +550,28 @@ func handleDiffResults(w http.ResponseWriter, r *http.Request) {
 
 func handleExportCSV(w http.ResponseWriter, r *http.Request) {
 	filtered, _, _, _ := filterAndSort(r)
-	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment;filename=pkgdash_export.csv")
-	writer := csv.NewWriter(w)
-	_ = writer.Write([]string{"Hostname", "Package", "Version", "Architecture", "CVE_Count"})
-	for _, i := range filtered {
-		cveCount := strconv.Itoa(len(i.Vulnerabilities))
-		_ = writer.Write([]string{i.Hostname, i.PkgName, i.Version, i.Arch, cveCount})
+	if err := pkgdash.WriteCSV(w, filtered); err != nil {
+		log.Printf("CSV export failed: %v", err)
 	}
-	writer.Flush()
 }
 
 func handleExportINI(w http.ResponseWriter, r *http.Request) {
 	filtered, _, _, _ := filterAndSort(r)
-	hostMap := make(map[string]bool)
-	for _, item := range filtered {
-		if item.Hostname != "" {
-			hostMap[item.Hostname] = true
-		}
-	}
-	var hosts []string
-	for h := range hostMap {
-		hosts = append(hosts, h)
-	}
-	sort.Strings(hosts)
-
-	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment;filename=inventory.ini")
-	_, _ = w.Write([]byte("[all]\n"))
-	for _, h := range hosts {
-		_, _ = w.Write([]byte(h))
-		_, _ = w.Write([]byte("\n"))
-	}
-}
-
-func createFieldMatcher(query string) func(string) bool {
-	if query == "" {
-		return func(s string) bool { return true }
-	}
-	if isLikelyRegex(query) {
-		re, err := regexp2.Compile(query, regexp2.IgnoreCase)
-		if err == nil {
-			return func(s string) bool {
-				matched, _ := re.MatchString(s)
-				return matched
-			}
-		}
-	}
-	terms := strings.Fields(strings.ToLower(query))
-	return func(s string) bool {
-		sLower := strings.ToLower(s)
-		for _, t := range terms {
-			if !strings.Contains(sLower, t) {
-				return false
-			}
-		}
-		return true
+	if _, err := pkgdash.WriteINI(w, filtered); err != nil {
+		log.Printf("INI export failed: %v", err)
 	}
 }
 
 func osLabel(name, version string) string {
-	label := strings.TrimSpace(strings.TrimSpace(name) + " " + strings.TrimSpace(version))
-	if label == "" {
-		return "Unknown"
-	}
-	return label
+	return pkgdash.OSLabel(name, version)
 }
 
 func isLikelyRegex(query string) bool {
-	for _, char := range []string{"^", "$", "*", "+", "?", "[", "]", "(", ")", "{", "}", "|", "\\"} {
-		if strings.Contains(query, char) {
-			return true
-		}
-	}
-	return false
+	return pkgdash.IsLikelyRegex(query)
 }
 
 // --- HTML TEMPLATES ---

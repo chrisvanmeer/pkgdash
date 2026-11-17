@@ -1,5 +1,5 @@
 # -- Stage 1: Build the application --
-FROM golang:1.24-alpine AS builder
+FROM golang:1.24.4-alpine3.21 AS builder
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /pkgdash-web ./cmd/pkgdash-web
 
 # -- Stage 2: Minimal runtime image --
-FROM alpine:latest
+FROM alpine:3.21
 
 # Install CA certificates for secure HTTPS API calls to pkgdashd
 RUN apk --no-cache add ca-certificates tzdata

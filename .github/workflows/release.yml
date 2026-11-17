@@ -26,18 +26,22 @@ jobs:
           # Linux AMD64
           GOOS=linux GOARCH=amd64 go build -o dist/pkgdash-linux-amd64 ./cmd/pkgdash
           GOOS=linux GOARCH=amd64 go build -o dist/pkgdashd-linux-amd64 ./cmd/pkgdashd
+          GOOS=linux GOARCH=amd64 go build -o dist/pkgdash-web-linux-amd64 ./cmd/pkgdash-web
 
           # Linux ARM64
           GOOS=linux GOARCH=arm64 go build -o dist/pkgdash-linux-arm64 ./cmd/pkgdash
           GOOS=linux GOARCH=arm64 go build -o dist/pkgdashd-linux-arm64 ./cmd/pkgdashd
+          GOOS=linux GOARCH=arm64 go build -o dist/pkgdash-web-linux-arm64 ./cmd/pkgdash-web
 
           # macOS ARM64 (Apple Silicon)
           GOOS=darwin GOARCH=arm64 go build -o dist/pkgdash-darwin-arm64 ./cmd/pkgdash
           GOOS=darwin GOARCH=arm64 go build -o dist/pkgdashd-darwin-arm64 ./cmd/pkgdashd
+          GOOS=darwin GOARCH=arm64 go build -o dist/pkgdash-web-darwin-arm64 ./cmd/pkgdash-web
 
           # macOS AMD64 (Intel)
           GOOS=darwin GOARCH=amd64 go build -o dist/pkgdash-darwin-amd64 ./cmd/pkgdash
           GOOS=darwin GOARCH=amd64 go build -o dist/pkgdashd-darwin-amd64 ./cmd/pkgdashd
+          GOOS=darwin GOARCH=amd64 go build -o dist/pkgdash-web-darwin-amd64 ./cmd/pkgdash-web
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

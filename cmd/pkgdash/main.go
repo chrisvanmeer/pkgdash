@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"compress/gzip"
 	"crypto/tls"
-	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +20,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/dlclark/regexp2"
+
+	"pkgdash-project/internal/pkgdash"
 )
 
 // ============================================================================
@@ -36,60 +34,15 @@ const (
 	PlaceholderVer  = "Filter version..."
 )
 
-type Vulnerability struct {
-	ID       string   `json:"id"`
-	CVE      []string `json:"cve,omitempty"`
-	Summary  string   `json:"summary,omitempty"`
-	Details  string   `json:"details,omitempty"`
-	URL      string   `json:"url,omitempty"`
-	Severity float64  `json:"severity,omitempty"`
-}
-
-type PackageInfo struct {
-	Name            string          `json:"name"`
-	Version         string          `json:"version"`
-	Arch            string          `json:"arch"`
-	Vulnerabilities []Vulnerability `json:"vulnerabilities,omitempty"`
-}
-
-type HostPayload struct {
-	Hostname     string        `json:"hostname"`
-	IPAddress    string        `json:"ip_address,omitempty"`
-	OSName       string        `json:"os_name,omitempty"`
-	OSVersion    string        `json:"os_version,omitempty"`
-	HostFunction string        `json:"host_function,omitempty"`
-	Packages     []PackageInfo `json:"packages"`
-	OSVEnabled   bool          `json:"osv_enabled"`
-}
-
-type FlatItem struct {
-	Hostname        string
-	IPAddress       string
-	OSName          string
-	OSVersion       string
-	HostFunction    string
-	PkgName         string
-	Version         string
-	Arch            string
-	Vulnerabilities []Vulnerability
-	OSVEnabled      bool
-}
-
-type DiffRow struct {
-	PkgName  string
-	VersionA string
-	VersionB string
-	IsDiff   bool
-}
-
-type ChangeEvent struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Hostname   string    `json:"hostname"`
-	Package    string    `json:"package"`
-	OldVersion string    `json:"old_version,omitempty"`
-	NewVersion string    `json:"new_version,omitempty"`
-	Action     string    `json:"action"` // "ADDED", "REMOVED", "MODIFIED"
-}
+// Domain types live in the shared package so the TUI and web UI cannot drift.
+type (
+	Vulnerability = pkgdash.Vulnerability
+	PackageInfo   = pkgdash.PackageInfo
+	HostPayload   = pkgdash.HostPayload
+	FlatItem      = pkgdash.FlatItem
+	DiffRow       = pkgdash.DiffRow
+	ChangeEvent   = pkgdash.ChangeEvent
+)
 
 type SortColumn int
 
@@ -248,11 +201,7 @@ var (
 )
 
 func formatOSLabel(name, version string) string {
-	label := strings.TrimSpace(strings.TrimSpace(name) + " " + strings.TrimSpace(version))
-	if label == "" {
-		return "Unknown"
-	}
-	return label
+	return pkgdash.OSLabel(name, version)
 }
 
 func renderSevBadge(sev float64) string {
@@ -457,50 +406,8 @@ func main() {
 }
 
 func getConfig() ([]string, string, float64) {
-	var servers []string
-	psk := os.Getenv("PKGDASH_PSK")
-	minSev := 0.0
-
-	if envMinSev := os.Getenv("PKGDASH_MIN_SEVERITY"); envMinSev != "" {
-		if v, err := strconv.ParseFloat(envMinSev, 64); err == nil {
-			minSev = v
-		}
-	}
-
-	if envServers := os.Getenv("PKGDASH_SERVERS"); envServers != "" {
-		servers = strings.Split(envServers, ",")
-	}
-
-	home, err := os.UserHomeDir()
-	if err == nil {
-		cfgPath := filepath.Join(home, ".local", "pkgdash.config")
-		if file, err := os.Open(cfgPath); err == nil {
-			defer func() { _ = file.Close() }()
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				if line == "" || strings.HasPrefix(line, "#") {
-					continue
-				}
-
-				if strings.HasPrefix(strings.ToLower(line), "psk=") {
-					if psk == "" {
-						psk = line[4:]
-					}
-				} else if strings.HasPrefix(strings.ToLower(line), "min_severity=") {
-					if os.Getenv("PKGDASH_MIN_SEVERITY") == "" {
-						if v, err := strconv.ParseFloat(line[13:], 64); err == nil {
-							minSev = v
-						}
-					}
-				} else if len(servers) == 0 {
-					servers = append(servers, line)
-				}
-			}
-			_ = scanner.Err()
-		}
-	}
-	return servers, psk, minSev
+	cfg := pkgdash.LoadClientConfig()
+	return cfg.Servers, cfg.PSK, cfg.MinSeverity
 }
 
 func fetchAllDataAsync(servers []string, psk string, minSev float64, updateChan chan dataMsg) {
@@ -706,47 +613,8 @@ func (m *model) switchFocus(target int) {
 }
 
 func (m *model) sortData() {
-	sort.Slice(m.allItems, func(i, j int) bool {
-		a, b := m.allItems[i], m.allItems[j]
-
-		ah, bh := strings.ToLower(a.Hostname), strings.ToLower(b.Hostname)
-		ao, bo := strings.ToLower(formatOSLabel(a.OSName, a.OSVersion)), strings.ToLower(formatOSLabel(b.OSName, b.OSVersion))
-		ap, bp := strings.ToLower(a.PkgName), strings.ToLower(b.PkgName)
-		av, bv := a.Version, b.Version
-
-		var primaryLess, primaryEqual bool
-
-		switch m.sortCol {
-		case SortHostname:
-			primaryLess = ah < bh
-			primaryEqual = ah == bh
-		case SortOS:
-			primaryLess = ao < bo
-			primaryEqual = ao == bo
-		case SortPackage:
-			primaryLess = ap < bp
-			primaryEqual = ap == bp
-		case SortVersion:
-			primaryLess = av < bv
-			primaryEqual = av == bv
-		}
-
-		if primaryEqual {
-			if ah != bh {
-				return ah < bh
-			}
-			if ap != bp {
-				return ap < bp
-			}
-			return av < bv
-		}
-
-		if m.sortDesc {
-			return !primaryLess
-		}
-		return primaryLess
-	})
-
+	fields := []pkgdash.SortField{pkgdash.SortHost, pkgdash.SortOS, pkgdash.SortPkg, pkgdash.SortVer}
+	pkgdash.SortItems(m.allItems, fields[m.sortCol], m.sortDesc)
 	m.filterItems()
 }
 
@@ -917,18 +785,8 @@ func saveCSV(items []FlatItem) string {
 	}
 	defer func() { _ = file.Close() }()
 
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	if err := writer.Write([]string{"Hostname", "Package", "Version", "Architecture", "CVE_Count"}); err != nil {
-		return fmt.Sprintf("Error writing CSV header: %v", err)
-	}
-
-	for _, item := range items {
-		cveCount := fmt.Sprintf("%d", len(item.Vulnerabilities))
-		if err := writer.Write([]string{item.Hostname, item.PkgName, item.Version, item.Arch, cveCount}); err != nil {
-			return fmt.Sprintf("Error writing CSV row: %v", err)
-		}
+	if err := pkgdash.WriteCSV(file, items); err != nil {
+		return fmt.Sprintf("Error writing CSV: %v", err)
 	}
 
 	return fmt.Sprintf("✓ Exported %d records to %s", len(items), filepath.Base(path))
@@ -944,23 +802,6 @@ func saveInventory(items []FlatItem) string {
 		return fmt.Sprintf("Error getting directory: %v", err)
 	}
 
-	hostMap := make(map[string]bool)
-	for _, item := range items {
-		if strings.TrimSpace(item.Hostname) != "" {
-			hostMap[item.Hostname] = true
-		}
-	}
-
-	if len(hostMap) == 0 {
-		return "No valid hosts found in search results"
-	}
-
-	var hosts []string
-	for h := range hostMap {
-		hosts = append(hosts, h)
-	}
-	sort.Strings(hosts)
-
 	path := filepath.Join(cwd, "temp_inventory.ini")
 	file, err := os.Create(path)
 	if err != nil {
@@ -968,64 +809,19 @@ func saveInventory(items []FlatItem) string {
 	}
 	defer func() { _ = file.Close() }()
 
-	var sb strings.Builder
-	sb.WriteString("[all]\n")
-	for _, h := range hosts {
-		sb.WriteString(h)
-		sb.WriteString("\n")
-	}
-
-	if _, err := file.WriteString(sb.String()); err != nil {
+	count, err := pkgdash.WriteINI(file, items)
+	if err != nil {
 		return fmt.Sprintf("Error writing inventory file: %v", err)
 	}
+	if count == 0 {
+		return "No valid hosts found in search results"
+	}
 
-	return fmt.Sprintf("✓ Exported %d host(s) to %s", len(hosts), filepath.Base(path))
+	return fmt.Sprintf("✓ Exported %d host(s) to %s", count, filepath.Base(path))
 }
 
 func buildDiffData(hostA, hostB string, allItems []FlatItem) []DiffRow {
-	pkgsA := make(map[string]string)
-	pkgsB := make(map[string]string)
-	allPkgNamesMap := make(map[string]bool)
-
-	for _, item := range allItems {
-		if strings.EqualFold(item.Hostname, hostA) {
-			pkgsA[item.PkgName] = item.Version
-			allPkgNamesMap[item.PkgName] = true
-		}
-		if strings.EqualFold(item.Hostname, hostB) {
-			pkgsB[item.PkgName] = item.Version
-			allPkgNamesMap[item.PkgName] = true
-		}
-	}
-
-	var pkgNames []string
-	for name := range allPkgNamesMap {
-		pkgNames = append(pkgNames, name)
-	}
-	sort.Strings(pkgNames)
-
-	var rows []DiffRow
-	for _, name := range pkgNames {
-		verA, hasA := pkgsA[name]
-		if !hasA {
-			verA = "-"
-		}
-		verB, hasB := pkgsB[name]
-		if !hasB {
-			verB = "-"
-		}
-
-		isDiff := (verA != verB)
-
-		rows = append(rows, DiffRow{
-			PkgName:  name,
-			VersionA: verA,
-			VersionB: verB,
-			IsDiff:   isDiff,
-		})
-	}
-
-	return rows
+	return pkgdash.BuildDiffData(hostA, hostB, allItems)
 }
 
 func (m *model) filterDiffItems() {
@@ -1649,70 +1445,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) filterItems() {
-	hQuery := strings.TrimSpace(m.hostInput.Value())
-	oQuery := strings.TrimSpace(m.osInput.Value())
-	pQuery := strings.TrimSpace(m.pkgInput.Value())
-	vQuery := strings.TrimSpace(m.verInput.Value())
-
-	if hQuery == "" && oQuery == "" && pQuery == "" && vQuery == "" && !m.showOnlyVulns {
-		m.filtered = m.allItems
-		return
-	}
-
-	hMatch := createFieldMatcher(hQuery)
-	oMatch := createFieldMatcher(oQuery)
-	pMatch := createFieldMatcher(pQuery)
-	vMatch := createFieldMatcher(vQuery)
-
-	var filtered []FlatItem
-	for _, item := range m.allItems {
-		if m.showOnlyVulns && len(item.Vulnerabilities) == 0 {
-			continue
-		}
-		if hMatch(item.Hostname) && oMatch(formatOSLabel(item.OSName, item.OSVersion)) && pMatch(item.PkgName) && vMatch(item.Version) {
-			filtered = append(filtered, item)
-		}
-	}
-
-	m.filtered = filtered
+	m.filtered = pkgdash.Filter(
+		m.allItems,
+		m.hostInput.Value(),
+		m.osInput.Value(),
+		m.pkgInput.Value(),
+		m.verInput.Value(),
+		m.showOnlyVulns,
+	)
 }
 
 func createFieldMatcher(query string) func(string) bool {
-	if query == "" {
-		return func(s string) bool { return true }
-	}
-
-	if isLikelyRegex(query) {
-		// regexp2.IgnoreCase vervangt de handmatige "(?i)" string-prefix
-		re, err := regexp2.Compile(query, regexp2.IgnoreCase)
-		if err == nil {
-			return func(s string) bool {
-				matched, _ := re.MatchString(s)
-				return matched
-			}
-		}
-	}
-
-	terms := strings.Fields(strings.ToLower(query))
-	return func(s string) bool {
-		sLower := strings.ToLower(s)
-		for _, term := range terms {
-			if !strings.Contains(sLower, term) {
-				return false
-			}
-		}
-		return true
-	}
+	return pkgdash.NewMatcher(query)
 }
 
 func isLikelyRegex(query string) bool {
-	metaChars := []string{"^", "$", "*", "+", "?", "[", "]", "(", ")", "{", "}", "|", "\\"}
-	for _, char := range metaChars {
-		if strings.Contains(query, char) {
-			return true
-		}
-	}
-	return false
+	return pkgdash.IsLikelyRegex(query)
 }
 
 func (m *model) getFleetInsights() string {

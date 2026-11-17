@@ -1,0 +1,151 @@
+package pkgdash
+
+import (
+	"bytes"
+	"encoding/csv"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestNewMatcher(t *testing.T) {
+	tests := []struct {
+		name, query, value string
+		want               bool
+	}{
+		{"empty matches all", "", "anything", true},
+		{"substring", "ubuntu", "Ubuntu 24.04", true},
+		{"and terms", "ubuntu 24", "Ubuntu 24.04", true},
+		{"and terms missing", "ubuntu 22", "Ubuntu 24.04", false},
+		{"regex anchor", "^Debian 12$", "Debian 12", true},
+		{"regex alternation", "ubuntu|alpine", "Alpine 3.19", true},
+		{"literal plus package", "libstdc++6", "libstdc++6", true},
+		{"invalid regex falls back", "[", "a[b", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NewMatcher(tt.query)(tt.value); got != tt.want {
+				t.Fatalf("NewMatcher(%q)(%q) = %v, want %v", tt.query, tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOSLabelAndFilter(t *testing.T) {
+	if got := OSLabel("  ", ""); got != "Unknown" {
+		t.Fatalf("OSLabel empty = %q", got)
+	}
+	items := []FlatItem{
+		{Hostname: "host01", OSName: "Ubuntu", OSVersion: "24.04 LTS", PkgName: "bash", Version: "5.2"},
+		{Hostname: "host02", OSName: "Debian", OSVersion: "12", PkgName: "bash", Version: "5.2"},
+		{Hostname: "host03", OSName: "Alpine", OSVersion: "3.19", PkgName: "openssl", Version: "3.0", Vulnerabilities: []Vulnerability{{ID: "CVE-1"}}},
+	}
+	check := func(host, osName, pkg, ver string, vulnOnly bool, want ...string) {
+		t.Helper()
+		got := Filter(items, host, osName, pkg, ver, vulnOnly)
+		if len(got) != len(want) {
+			t.Fatalf("Filter(%q,%q,%q,%q,%v) = %d items, want %d", host, osName, pkg, ver, vulnOnly, len(got), len(want))
+		}
+		for i, name := range want {
+			if got[i].Hostname != name {
+				t.Fatalf("item %d = %s, want %s", i, got[i].Hostname, name)
+			}
+		}
+	}
+	check("host0[13]", "", "", "", false, "host01", "host03")
+	check("", "ubuntu", "", "", false, "host01")
+	check("", "^Debian 12$", "bash", "", false, "host02")
+	check("", "alpine", "openssl", "", false, "host03")
+	check("", "", "", "", true, "host03")
+}
+
+func TestSortItemsNaturalVersions(t *testing.T) {
+	items := []FlatItem{
+		{Hostname: "h", PkgName: "p", Version: "1.9"},
+		{Hostname: "h", PkgName: "p", Version: "1.10"},
+		{Hostname: "h", PkgName: "p", Version: "1.2"},
+	}
+	SortItems(items, SortVer, false)
+	want := []string{"1.2", "1.9", "1.10"}
+	for i, v := range want {
+		if items[i].Version != v {
+			t.Fatalf("sorted[%d] = %s, want %s", i, items[i].Version, v)
+		}
+	}
+}
+
+func TestBuildDiffDataKeepsArchitectures(t *testing.T) {
+	items := []FlatItem{
+		{Hostname: "a", PkgName: "glibc", Arch: "amd64", Version: "2.1"},
+		{Hostname: "a", PkgName: "glibc", Arch: "arm64", Version: "2.2"},
+		{Hostname: "b", PkgName: "glibc", Arch: "amd64", Version: "2.3"},
+	}
+	rows := BuildDiffData("a", "b", items)
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2: %+v", len(rows), rows)
+	}
+	if rows[0].VersionA != "2.1" || rows[1].VersionA != "2.2" {
+		t.Fatalf("architectures collapsed: %+v", rows)
+	}
+}
+
+func TestExports(t *testing.T) {
+	items := []FlatItem{
+		{Hostname: " host1 ", PkgName: "bash", Version: "5.2", Arch: "amd64", Vulnerabilities: []Vulnerability{{ID: "cve"}}},
+		{Hostname: "bad\nhost", PkgName: "x", Version: "1"},
+		{Hostname: "  ", PkgName: "y", Version: "1"},
+	}
+
+	var csvOut bytes.Buffer
+	if err := WriteCSV(&csvOut, items); err != nil {
+		t.Fatal(err)
+	}
+	records, err := csv.NewReader(strings.NewReader(csvOut.String())).ReadAll()
+	if err != nil || len(records) != 4 {
+		t.Fatalf("CSV records = %d, err = %v", len(records), err)
+	}
+	if records[1][4] != "1" {
+		t.Fatalf("CVE count = %q", records[1][4])
+	}
+
+	var iniOut bytes.Buffer
+	count, err := WriteINI(&iniOut, items)
+	if err != nil || count != 2 {
+		t.Fatalf("INI count = %d, err = %v", count, err)
+	}
+	if !strings.Contains(iniOut.String(), "[all]\nbad_host\nhost1\n") {
+		t.Fatalf("unexpected INI: %q", iniOut.String())
+	}
+}
+
+func TestLoadClientConfigEnvironmentWins(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PKGDASH_SERVERS", " https://env.example:9876 , https://second.example ")
+	t.Setenv("PKGDASH_PSK", " env-psk ")
+	t.Setenv("PKGDASH_WEB_PORT", "9090")
+
+	configDir := filepath.Join(home, ".local")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "# config\nhttps://file.example\npsk = file-psk\nmin_severity=7.0\nweb_port=:7070\n"
+	if err := os.WriteFile(filepath.Join(configDir, "pkgdash.config"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := LoadClientConfig()
+	if len(cfg.Servers) != 2 || cfg.Servers[0] != "https://env.example:9876" {
+		t.Fatalf("servers = %+v", cfg.Servers)
+	}
+	if cfg.PSK != "env-psk" {
+		t.Fatalf("psk = %q", cfg.PSK)
+	}
+	if cfg.MinSeverity != 7.0 {
+		t.Fatalf("min severity = %v", cfg.MinSeverity)
+	}
+	if cfg.WebPort != ":9090" {
+		t.Fatalf("web port = %q", cfg.WebPort)
+	}
+}
